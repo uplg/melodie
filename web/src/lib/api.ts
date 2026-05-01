@@ -74,6 +74,12 @@ export async function fetchSongs(): Promise<Song[]> {
   return (await res.json()) as Song[];
 }
 
+export async function fetchSong(id: string): Promise<Song> {
+  const res = await fetch(`/api/songs/${id}`);
+  if (!res.ok) throw new Error(`fetchSong failed: ${res.status}`);
+  return (await res.json()) as Song;
+}
+
 export interface AdminSong extends Song {
   owner: { id: string; display_name: string };
 }

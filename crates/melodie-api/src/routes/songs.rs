@@ -4,11 +4,11 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
-use futures_util::stream::Stream;
 use melodie_core::authz::{self, Action, Resource};
 use melodie_core::ids::SongId;
 use melodie_core::model::{Song, SongMode, SongStatus};
@@ -347,7 +347,7 @@ async fn events(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path(id): Path<String>,
-) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
+) -> ApiResult<impl IntoResponse> {
     let song_id = parse_song_id(&id)?;
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
@@ -408,7 +408,17 @@ async fn events(
         }
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    let sse = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+
+    // Anti-buffering hints. `X-Accel-Buffering: no` tells nginx (and most
+    // reverse proxies that cargo-culted nginx semantics) to not collect the
+    // response. Cache-Control mirrors what axum already sets but explicit
+    // here makes it harder to forget on some intermediaries.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    headers.insert("cache-control", HeaderValue::from_static("no-cache, no-transform"));
+
+    Ok((headers, sse))
 }
 
 async fn list(

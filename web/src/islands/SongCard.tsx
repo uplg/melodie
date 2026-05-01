@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { Clip, Song, SongEvent } from '../lib/api';
+import { fetchSong, type Clip, type Song, type SongEvent } from '../lib/api';
 
 interface Props {
   song: Song;
@@ -38,6 +38,34 @@ export default function SongCard({ song, onUpdate, onDelete, onRename, owner }: 
       es.removeEventListener('update', handleUpdate as EventListener);
       es.close();
     };
+  }, [song.id, song.status, onUpdate]);
+
+  // Polling fallback: belt-and-suspenders for when SSE stalls (Astro/undici
+  // streaming quirks, network blips, lagged broadcast subscriber). Idempotent
+  // with the SSE updates — both call onUpdate with the same shape and the
+  // merge in applySongEvent only changes fields that need changing.
+  useEffect(() => {
+    if (song.status === 'complete' || song.status === 'failed') return;
+    const tick = async () => {
+      try {
+        const fresh = await fetchSong(song.id);
+        onUpdate({
+          song_id: fresh.id,
+          status: fresh.status,
+          clips: fresh.clips.map((c) => ({
+            id: c.id,
+            variant_index: c.variant_index,
+            status: c.status,
+            duration_s: c.duration_s,
+            image_url: c.image_url,
+          })),
+        });
+      } catch {
+        // Network blips are fine; SSE may pick it up.
+      }
+    };
+    const id = setInterval(tick, 8_000);
+    return () => clearInterval(id);
   }, [song.id, song.status, onUpdate]);
 
   const handleDelete = () => {

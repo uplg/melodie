@@ -7,9 +7,12 @@ const API_BACKEND = import.meta.env.API_INTERNAL ?? 'http://127.0.0.1:8080';
  * which forwards /api/* to the local axum backend. Keeps the surface small
  * and avoids CORS.
  *
- * Streaming-friendly: the request body is passed through and so is the
- * response. Works for SSE on /api/songs/{id}/events because neither side
- * buffers.
+ * Streaming-friendly: we rebuild the Response with the upstream body stream
+ * rather than returning the fetch() Response verbatim. Some Astro adapter +
+ * undici combinations buffer when handed back the raw Response — most
+ * visible on `text/event-stream` where the SSE pipeline silently stalls
+ * after the initial frame. The new-Response trick forces the adapter into
+ * streaming mode.
  */
 export const onRequest = defineMiddleware(async (ctx, next) => {
   const url = new URL(ctx.request.url);
@@ -18,17 +21,17 @@ export const onRequest = defineMiddleware(async (ctx, next) => {
   }
 
   const target = API_BACKEND + url.pathname + url.search;
-  const headers = new Headers(ctx.request.headers);
+  const reqHeaders = new Headers(ctx.request.headers);
   // Drop hop-by-hop / origin-bound headers that would confuse the backend.
-  headers.delete('host');
-  headers.delete('content-length');
+  reqHeaders.delete('host');
+  reqHeaders.delete('content-length');
 
   const method = ctx.request.method.toUpperCase();
   const noBody = method === 'GET' || method === 'HEAD';
 
   const init: RequestInit & { duplex?: 'half' } = {
     method,
-    headers,
+    headers: reqHeaders,
     redirect: 'manual',
   };
   if (!noBody) {
@@ -38,5 +41,21 @@ export const onRequest = defineMiddleware(async (ctx, next) => {
     init.duplex = 'half';
   }
 
-  return fetch(target, init);
+  const upstream = await fetch(target, init);
+
+  // Rebuild the Response so the adapter sees a fresh streaming body. Without
+  // this, SSE responses stall on some Astro/undici combos (handler sends the
+  // first frame then nothing reaches the browser until the connection ends).
+  const respHeaders = new Headers(upstream.headers);
+  // Disable buffering hints for any intermediate (nginx, reverse proxies).
+  if (respHeaders.get('content-type')?.includes('text/event-stream')) {
+    respHeaders.set('x-accel-buffering', 'no');
+    respHeaders.set('cache-control', 'no-cache, no-transform');
+  }
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: respHeaders,
+  });
 });
