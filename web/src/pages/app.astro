@@ -1,0 +1,56 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { fetchMe } from '../lib/api';
+import MelodieApp from '../islands/MelodieApp.tsx';
+
+const me = await fetchMe(Astro.request);
+if (!me) return Astro.redirect('/login');
+---
+
+<Layout title="Melodie">
+  <header
+    class="sticky top-0 z-10 border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50/80 dark:bg-neutral-950/80 backdrop-blur"
+  >
+    <div class="mx-auto max-w-5xl flex items-center justify-between px-6 py-3">
+      <h1 class="text-lg font-semibold tracking-tight">Melodie</h1>
+      <div class="flex items-center gap-3 text-sm">
+        <span class="text-neutral-600 dark:text-neutral-400">
+          {me.display_name}
+          {me.role === 'admin' && (
+            <span
+              class="ml-1 rounded bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs uppercase tracking-wide"
+            >
+              admin
+            </span>
+          )}
+        </span>
+        {me.role === 'admin' && (
+          <a
+            href="/admin"
+            class="rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-900"
+          >
+            Admin
+          </a>
+        )}
+        <button
+          id="logout"
+          type="button"
+          class="rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-900"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-3xl px-6 py-8">
+    <MelodieApp client:load />
+  </main>
+
+  <script is:inline>
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      window.location.href = '/login';
+    });
+  </script>
+</Layout>

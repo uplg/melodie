@@ -1,0 +1,89 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { fetchMe } from '../lib/api';
+
+const me = await fetchMe(Astro.request);
+if (me) return Astro.redirect('/app');
+---
+
+<Layout title="Sign in — Melodie">
+  <main class="mx-auto max-w-md px-6 py-16">
+    <h1 class="text-2xl font-semibold tracking-tight">Sign in</h1>
+    <p class="mt-2 text-sm text-neutral-600 dark:text-neutral-400">
+      Welcome back.
+    </p>
+
+    <form id="login-form" class="mt-8 space-y-4" novalidate>
+      <label class="block">
+        <span class="text-sm font-medium">Email</span>
+        <input
+          name="email"
+          type="email"
+          required
+          autocomplete="email"
+          class="mt-1 w-full rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-400"
+        />
+      </label>
+      <label class="block">
+        <span class="text-sm font-medium">Password</span>
+        <input
+          name="password"
+          type="password"
+          required
+          autocomplete="current-password"
+          class="mt-1 w-full rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-400"
+        />
+      </label>
+
+      <p
+        id="login-error"
+        class="hidden text-sm text-red-600 dark:text-red-400"
+        role="alert"
+      ></p>
+
+      <button
+        type="submit"
+        class="w-full rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-3 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-50"
+      >
+        Sign in
+      </button>
+    </form>
+
+    <p class="mt-6 text-sm text-neutral-600 dark:text-neutral-400">
+      No account?{' '}
+      <a class="underline" href="/signup">Sign up</a> with an invite code.
+    </p>
+  </main>
+
+  <script is:inline>
+    const form = document.getElementById('login-form');
+    const errEl = document.getElementById('login-error');
+    const button = form.querySelector('button[type="submit"]');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.classList.add('hidden');
+      button.disabled = true;
+      try {
+        const data = Object.fromEntries(new FormData(form));
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (res.ok) {
+          window.location.href = '/app';
+          return;
+        }
+        const body = await res.json().catch(() => ({}));
+        errEl.textContent = body?.error?.message ?? `Sign-in failed (${res.status})`;
+        errEl.classList.remove('hidden');
+      } catch (err) {
+        errEl.textContent = 'Network error — try again.';
+        errEl.classList.remove('hidden');
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</Layout>

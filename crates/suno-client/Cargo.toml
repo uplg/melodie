@@ -1,0 +1,32 @@
+[package]
+name = "suno-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP client for the (unofficial) Suno API. Vendored from paperfoot/suno-cli."
+
+[features]
+default = []
+# Enables the in-process hCaptcha solver via piloted Chrome (CDP).
+# Requires:
+# - `chromium` or `google-chrome` installed (auto-located, override with SUNO_CHROME_PATH)
+# - rookie can read the host's main Chrome cookie DB (one-time Keychain prompt on macOS)
+# Off by default. Off, callers must pass a pre-solved token to `SunoClient::generate`.
+captcha = ["dep:tokio-tungstenite", "dep:rookie", "dep:dirs"]
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+tokio-tungstenite = { workspace = true, optional = true }
+rookie = { version = "0.5", optional = true }
+dirs = { version = "5", optional = true }

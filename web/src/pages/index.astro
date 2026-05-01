@@ -1,0 +1,8 @@
+---
+import { fetchMe } from '../lib/api';
+
+if (await fetchMe(Astro.request)) {
+  return Astro.redirect('/app');
+}
+return Astro.redirect('/login');
+---

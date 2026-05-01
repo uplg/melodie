@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/suno-client",
+    "crates/melodie-core",
+    "crates/melodie-db",
+    "crates/melodie-api",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/leonardcherouvrier/melodie"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "process", "net", "sync"] }
+futures-util = "0.3"
+
+# http client (used by suno-client)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+# http server
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip", "set-header"] }
+tower-sessions = "0.14"
+tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
+tower-governor = "0.7"
+
+# db
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate", "uuid", "chrono"] }
+
+# serde / errors / time / ids
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# crypto / auth
+argon2 = "0.5"
+rand = "0.9"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+time = { version = "0.3", default-features = false, features = ["std", "macros", "serde"] }
+
+# id3 + audio (suno-client uses)
+id3 = "1"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# openapi (for typed front client)
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
