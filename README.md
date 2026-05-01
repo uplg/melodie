@@ -22,7 +22,7 @@ crates/
   melodie-core/  # domain types + traits
   melodie-db/    # sqlx pool + migrations
   melodie-api/   # axum binary
-web/             # Astro 6 app (lands in P3)
+web/             # Astro 6 app
 ```
 
 ## Prerequisites
@@ -44,7 +44,7 @@ just dev          # api + web in parallel (web lands in P3)
 ## Going live
 
 ```bash
-just dev                                  # in one terminal
+just live                                  # in one terminal
 cloudflared tunnel --url http://localhost:3000   # in another
 ```
 
@@ -62,9 +62,3 @@ DB:
   admin invite (idempotent across restarts).
 - Otherwise a random URL-safe code is generated and logged at WARN level —
   copy it from the logs, sign up with it, you become admin.
-
-## Status
-
-P0 — foundations ✅
-P1 — auth + DB + sessions ✅
-P2 — Suno bridge + generation path ✅
