@@ -40,3 +40,49 @@ pub async fn count_today(pool: &SqlitePool, user_id: UserId) -> Result<u32, DbEr
             .await?;
     Ok(n.map(|(c,)| c as u32).unwrap_or(0))
 }
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct QuotaRow {
+    pub user_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub count: i64,
+}
+
+/// Today's quota state for every user, including those with zero generations.
+/// LEFT JOIN so a user who hasn't generated yet today still appears with `count=0`.
+pub async fn list_today_with_users(pool: &SqlitePool) -> Result<Vec<QuotaRow>, DbError> {
+    let day_utc = Utc::now().format("%Y-%m-%d").to_string();
+    let rows = sqlx::query_as::<_, QuotaRow>(
+        "SELECT u.id AS user_id, u.display_name, u.role, COALESCE(q.count, 0) AS count \
+         FROM users u \
+         LEFT JOIN generation_quota q ON q.user_id = u.id AND q.day_utc = ? \
+         ORDER BY count DESC, u.display_name COLLATE NOCASE",
+    )
+    .bind(&day_utc)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Drop today's quota row for `user_id`. Returns rows affected (0 if the user
+/// hadn't generated yet today, 1 otherwise).
+pub async fn reset_user_today(pool: &SqlitePool, user_id: UserId) -> Result<u64, DbError> {
+    let day_utc = Utc::now().format("%Y-%m-%d").to_string();
+    let r = sqlx::query("DELETE FROM generation_quota WHERE user_id = ? AND day_utc = ?")
+        .bind(user_id.to_string())
+        .bind(&day_utc)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// Drop today's quota row for every user.
+pub async fn reset_all_today(pool: &SqlitePool) -> Result<u64, DbError> {
+    let day_utc = Utc::now().format("%Y-%m-%d").to_string();
+    let r = sqlx::query("DELETE FROM generation_quota WHERE day_utc = ?")
+        .bind(&day_utc)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}

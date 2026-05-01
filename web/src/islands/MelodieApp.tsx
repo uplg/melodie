@@ -3,6 +3,7 @@ import {
   applySongEvent,
   deleteSong as deleteSongApi,
   fetchSongs,
+  renameSong as renameSongApi,
   type Song,
   type SongEvent,
 } from '../lib/api';
@@ -55,6 +56,11 @@ export default function MelodieApp() {
     }
   }, [songs]);
 
+  const handleRename = useCallback(async (id: string, title: string) => {
+    await renameSongApi(id, title);
+    setSongs((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
+  }, []);
+
   return (
     <div className="space-y-6">
       <CreatePanel onCreated={handleCreated} />
@@ -64,6 +70,7 @@ export default function MelodieApp() {
         error={listError}
         onUpdate={handleUpdate}
         onDelete={handleDelete}
+        onRename={handleRename}
       />
     </div>
   );

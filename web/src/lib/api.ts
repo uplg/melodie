@@ -91,6 +91,21 @@ export async function deleteSong(id: string): Promise<void> {
   }
 }
 
+export async function renameSong(id: string, title: string): Promise<Song> {
+  const res = await fetch(`/api/songs/${id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) {
+    const body = await res
+      .json()
+      .catch(() => null as { error?: { message?: string } } | null);
+    throw new Error(body?.error?.message ?? `renameSong failed: ${res.status}`);
+  }
+  return (await res.json()) as Song;
+}
+
 // --- Admin types + helpers ---
 
 export interface Health {
@@ -147,6 +162,33 @@ export async function setSunoCookie(cookie: string): Promise<void> {
       .catch(() => null as { error?: { message?: string } } | null);
     throw new Error(body?.error?.message ?? `setSunoCookie failed: ${res.status}`);
   }
+}
+
+export interface QuotaRow {
+  user_id: string;
+  display_name: string;
+  role: 'admin' | 'member';
+  count_today: number;
+  /** `null` for admins (no cap) */
+  cap: number | null;
+}
+
+export async function fetchQuotas(): Promise<QuotaRow[]> {
+  const res = await fetch('/api/admin/quotas');
+  if (!res.ok) throw new Error(`fetchQuotas failed: ${res.status}`);
+  return (await res.json()) as QuotaRow[];
+}
+
+export async function resetUserQuota(userId: string): Promise<void> {
+  const res = await fetch(`/api/admin/quotas/${userId}`, { method: 'DELETE' });
+  if (!res.ok && res.status !== 204)
+    throw new Error(`resetUserQuota failed: ${res.status}`);
+}
+
+export async function resetAllQuotas(): Promise<void> {
+  const res = await fetch('/api/admin/quotas', { method: 'DELETE' });
+  if (!res.ok && res.status !== 204)
+    throw new Error(`resetAllQuotas failed: ${res.status}`);
 }
 
 /**

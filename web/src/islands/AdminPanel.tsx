@@ -3,15 +3,20 @@ import {
   createInvite,
   fetchHealth,
   fetchInvites,
+  fetchQuotas,
+  resetAllQuotas,
+  resetUserQuota,
   setSunoCookie,
   type Health,
   type Invite,
+  type QuotaRow,
 } from '../lib/api';
 
 export default function AdminPanel() {
   return (
     <div className="space-y-6">
       <SunoSection />
+      <QuotasSection />
       <InvitesSection />
     </div>
   );
@@ -125,6 +130,130 @@ function SunoSection() {
           {submitting ? 'Submitting…' : 'Submit cookie'}
         </button>
       </form>
+    </section>
+  );
+}
+
+function QuotasSection() {
+  const [rows, setRows] = useState<QuotaRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    setLoading(true);
+    fetchQuotas()
+      .then((rs) => {
+        setRows(rs);
+        setError(null);
+      })
+      .catch((e: unknown) =>
+        setError(e instanceof Error ? e.message : 'Failed to load quotas')
+      )
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const onResetUser = async (id: string) => {
+    setBusy(id);
+    try {
+      await resetUserQuota(id);
+      refresh();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Reset failed');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onResetAll = async () => {
+    if (!confirm('Reset today\'s quota for ALL users?')) return;
+    setBusy('__all__');
+    try {
+      await resetAllQuotas();
+      refresh();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Reset failed');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 space-y-4">
+      <header className="flex items-baseline justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">Quotas</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Daily generation count per user (UTC). Admins have no cap.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onResetAll}
+          disabled={busy !== null || rows.every((r) => r.count_today === 0)}
+          className="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900 disabled:opacity-50"
+        >
+          Reset all
+        </button>
+      </header>
+
+      {error && (
+        <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+      )}
+
+      {loading ? (
+        <p className="text-sm text-neutral-500">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="text-sm text-neutral-500">No users yet.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs uppercase text-neutral-500">
+              <tr>
+                <th className="py-2 pr-3 font-medium">User</th>
+                <th className="py-2 pr-3 font-medium">Role</th>
+                <th className="py-2 pr-3 font-medium">Today</th>
+                <th className="py-2 pr-3 font-medium"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-neutral-200 dark:divide-neutral-800">
+              {rows.map((r) => {
+                const atCap = r.cap !== null && r.count_today >= r.cap;
+                return (
+                  <tr key={r.user_id}>
+                    <td className="py-2 pr-3">{r.display_name}</td>
+                    <td className="py-2 pr-3 text-neutral-500">{r.role}</td>
+                    <td className="py-2 pr-3">
+                      <span className={atCap ? 'text-red-600 dark:text-red-400 font-medium' : ''}>
+                        {r.count_today}
+                        {r.cap !== null ? ` / ${r.cap}` : ''}
+                      </span>
+                    </td>
+                    <td className="py-2 pr-3 text-right">
+                      {r.cap !== null && r.count_today > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => onResetUser(r.user_id)}
+                          disabled={busy !== null}
+                          className="text-xs rounded border border-neutral-300 dark:border-neutral-700 px-2 py-0.5 hover:bg-neutral-100 dark:hover:bg-neutral-900 disabled:opacity-50"
+                        >
+                          {busy === r.user_id ? '…' : 'Reset'}
+                        </button>
+                      ) : (
+                        <span className="text-xs text-neutral-400">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }

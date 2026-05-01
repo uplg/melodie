@@ -1,10 +1,12 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { Clip, Song, SongEvent } from '../lib/api';
 
 interface Props {
   song: Song;
   onUpdate: (ev: SongEvent) => void;
   onDelete: (id: string) => void;
+  /** Async rename — parent owns the API call and updates its state. */
+  onRename: (id: string, title: string) => Promise<void>;
   /**
    * When set, surfaces the song's owner on the card. Used by the admin feed
    * — the regular /app list is owner-implicit so this stays undefined there.
@@ -12,7 +14,7 @@ interface Props {
   owner?: string;
 }
 
-export default function SongCard({ song, onUpdate, onDelete, owner }: Props) {
+export default function SongCard({ song, onUpdate, onDelete, onRename, owner }: Props) {
   // Subscribe to live updates while the song is still in flight. EventSource
   // is same-origin (proxied via /api/*), so cookies ride along automatically.
   useEffect(() => {
@@ -44,13 +46,75 @@ export default function SongCard({ song, onUpdate, onDelete, owner }: Props) {
     }
   };
 
+  // --- inline title rename ---
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const startEdit = () => {
+    setDraft(song.title ?? '');
+    setEditing(true);
+  };
+  const cancel = () => {
+    setEditing(false);
+    setDraft('');
+  };
+  const save = async () => {
+    const t = draft.trim();
+    if (!t || t === (song.title ?? '')) {
+      cancel();
+      return;
+    }
+    setSaving(true);
+    try {
+      await onRename(song.id, t);
+      setEditing(false);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Rename failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <li className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-4 space-y-3">
       <header className="flex items-baseline justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="truncate text-base font-semibold tracking-tight">
-            {song.title ?? <span className="text-neutral-500">untitled</span>}
-          </h3>
+          {editing ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void save();
+                } else if (e.key === 'Escape') {
+                  cancel();
+                }
+              }}
+              onBlur={() => void save()}
+              disabled={saving}
+              maxLength={100}
+              className="w-full rounded border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-950 px-2 py-1 text-base font-semibold tracking-tight focus:outline-none focus:ring-2 focus:ring-neutral-400"
+            />
+          ) : (
+            <h3
+              role="button"
+              tabIndex={0}
+              onClick={startEdit}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  startEdit();
+                }
+              }}
+              title="Click to rename"
+              className="truncate text-base font-semibold tracking-tight cursor-text rounded hover:bg-neutral-100 dark:hover:bg-neutral-800 px-1 -mx-1"
+            >
+              {song.title ?? <span className="text-neutral-500">Untitled</span>}
+            </h3>
+          )}
           <p className="mt-0.5 text-xs text-neutral-500 truncate">
             {owner && (
               <>

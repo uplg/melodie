@@ -148,6 +148,41 @@ pub async fn set_status(
     Ok(())
 }
 
+/// Set the title only when the row currently has none. Used by the poll task
+/// to lift Suno-generated titles into describe-mode rows that started with
+/// `title = NULL`. Idempotent and cheap. Returns rows affected.
+pub async fn set_title_if_missing(
+    pool: &SqlitePool,
+    song_id: SongId,
+    title: &str,
+) -> Result<u64, DbError> {
+    let r = sqlx::query(
+        "UPDATE songs SET title = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND (title IS NULL OR title = '')",
+    )
+    .bind(title)
+    .bind(song_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Unconditional title set, used by the manual rename endpoint.
+pub async fn set_title(
+    pool: &SqlitePool,
+    song_id: SongId,
+    title: &str,
+) -> Result<u64, DbError> {
+    let r = sqlx::query(
+        "UPDATE songs SET title = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(title)
+    .bind(song_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 pub async fn find_with_clips(
     pool: &SqlitePool,
     song_id: SongId,

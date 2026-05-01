@@ -1,17 +1,20 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
+use melodie_core::ids::UserId;
 use melodie_core::model::Role;
 use melodie_db::invites::InviteListRow;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::AdminUser;
+use crate::routes::songs::DAILY_CAP;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -20,6 +23,8 @@ pub fn router() -> Router<AppState> {
         .route("/admin/health", get(get_health))
         .route("/admin/invites", get(list_invites).post(create_invite))
         .route("/admin/songs", get(list_all_songs))
+        .route("/admin/quotas", get(list_quotas).delete(reset_all_quotas))
+        .route("/admin/quotas/{user_id}", axum::routing::delete(reset_user_quota))
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,4 +217,54 @@ async fn list_all_songs(
         })
         .collect();
     Ok(Json(out))
+}
+
+// --- quotas ---
+
+#[derive(Debug, Serialize)]
+struct QuotaView {
+    user_id: String,
+    display_name: String,
+    role: String,
+    count_today: u32,
+    /// `null` for admins (they bypass the daily cap entirely).
+    cap: Option<u32>,
+}
+
+async fn list_quotas(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> ApiResult<Json<Vec<QuotaView>>> {
+    let rows = melodie_db::quota::list_today_with_users(&state.db).await?;
+    let out = rows
+        .into_iter()
+        .map(|r| QuotaView {
+            cap: if r.role == "admin" { None } else { Some(DAILY_CAP) },
+            user_id: r.user_id,
+            display_name: r.display_name,
+            role: r.role,
+            count_today: r.count.max(0) as u32,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn reset_user_quota(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(user_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let id = Uuid::parse_str(&user_id)
+        .map(UserId)
+        .map_err(|_| ApiError::BadRequest("invalid user id".into()))?;
+    melodie_db::quota::reset_user_today(&state.db, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reset_all_quotas(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> ApiResult<StatusCode> {
+    melodie_db::quota::reset_all_today(&state.db).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

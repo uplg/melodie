@@ -3,6 +3,7 @@ import {
   applySongEvent,
   deleteSong as deleteSongApi,
   fetchAdminSongs,
+  renameSong as renameSongApi,
   type AdminSong,
   type SongEvent,
 } from '../lib/api';
@@ -60,6 +61,11 @@ export default function AdminFeed() {
     [songs]
   );
 
+  const handleRename = useCallback(async (id: string, title: string) => {
+    await renameSongApi(id, title);
+    setSongs((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
+  }, []);
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -102,6 +108,7 @@ export default function AdminFeed() {
               owner={song.owner.display_name}
               onUpdate={handleUpdate}
               onDelete={handleDelete}
+              onRename={handleRename}
             />
           ))}
         </ul>

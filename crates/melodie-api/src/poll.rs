@@ -110,6 +110,19 @@ async fn run(state: &AppState, song_id: SongId, clip_ids: &[String]) -> Result<(
             tracing::warn!(error = %e, %song_id, "poll: clip upsert failed");
         }
 
+        // Lift Suno-picked title into describe-mode songs that started untitled.
+        // No-op (cheap WHERE filter) once the row has a title.
+        if let Some(t) = suno_clips
+            .iter()
+            .find_map(|c| {
+                let t = c.title.trim();
+                if t.is_empty() { None } else { Some(t.to_string()) }
+            })
+            && let Err(e) = melodie_db::songs::set_title_if_missing(&state.db, song_id, &t).await
+        {
+            tracing::debug!(error = %e, %song_id, "poll: set_title_if_missing failed");
+        }
+
         let new_status = aggregate(&suno_clips);
         if new_status != last_status {
             if let Err(e) =

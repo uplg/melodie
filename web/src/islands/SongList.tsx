@@ -7,9 +7,17 @@ interface Props {
   error: string | null;
   onUpdate: (ev: SongEvent) => void;
   onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => Promise<void>;
 }
 
-export default function SongList({ songs, loading, error, onUpdate, onDelete }: Props) {
+export default function SongList({
+  songs,
+  loading,
+  error,
+  onUpdate,
+  onDelete,
+  onRename,
+}: Props) {
   if (loading) {
     return (
       <div className="rounded-md border border-dashed border-neutral-300 dark:border-neutral-700 p-6 text-sm text-neutral-500">
@@ -37,7 +45,13 @@ export default function SongList({ songs, loading, error, onUpdate, onDelete }: 
   return (
     <ul className="space-y-3">
       {songs.map((song) => (
-        <SongCard key={song.id} song={song} onUpdate={onUpdate} onDelete={onDelete} />
+        <SongCard
+          key={song.id}
+          song={song}
+          onUpdate={onUpdate}
+          onDelete={onDelete}
+          onRename={onRename}
+        />
       ))}
     </ul>
   );

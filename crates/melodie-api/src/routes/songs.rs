@@ -28,13 +28,16 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/songs", post(create).get(list))
-        .route("/songs/{id}", get(detail).delete(delete_song))
+        .route(
+            "/songs/{id}",
+            get(detail).delete(delete_song).patch(rename),
+        )
         .route("/songs/{id}/events", get(events))
 }
 
 // --- daily quota ---
 
-const DAILY_CAP: u32 = 4;
+pub const DAILY_CAP: u32 = 4;
 
 // --- field caps (mirror Suno's documented limits) ---
 
@@ -436,6 +439,45 @@ async fn detail(
     ) {
         return Err(ApiError::Forbidden);
     }
+    Ok(Json(SongView::from(&song)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameRequest {
+    title: String,
+}
+
+async fn rename(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<RenameRequest>,
+) -> ApiResult<Json<SongView>> {
+    let song_id = parse_song_id(&id)?;
+    let title = req.title.trim();
+    if title.is_empty() || title.len() > TITLE_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "title must be 1-{TITLE_MAX} characters"
+        )));
+    }
+    let song = melodie_db::songs::find_with_clips(&state.db, song_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !authz::can(
+        user.role,
+        user.id,
+        Action::Write,
+        Resource::Song {
+            owner_id: song.owner_id,
+            song_id,
+        },
+    ) {
+        return Err(ApiError::Forbidden);
+    }
+    melodie_db::songs::set_title(&state.db, song_id, title).await?;
+    let song = melodie_db::songs::find_with_clips(&state.db, song_id)
+        .await?
+        .ok_or(ApiError::Internal("song vanished after rename".into()))?;
     Ok(Json(SongView::from(&song)))
 }
 
