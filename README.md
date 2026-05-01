@@ -41,7 +41,7 @@ just run          # run just the API
 just dev          # api + web in parallel (web lands in P3)
 ```
 
-## Going live (when P3 has shipped)
+## Going live
 
 ```bash
 just dev                                  # in one terminal
@@ -67,4 +67,4 @@ DB:
 
 P0 — foundations ✅
 P1 — auth + DB + sessions ✅
-P2 — Suno bridge + generation path (in progress)
+P2 — Suno bridge + generation path ✅
