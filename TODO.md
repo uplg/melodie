@@ -1,0 +1,2 @@
+- Bind to Homie to send music into !yt (Push into live add to queue) (Maybe vote for variant?)
+- Send to Homie current cloudflare URL and bind to a dynamic command (!melodie)

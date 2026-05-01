@@ -10,6 +10,7 @@ mod health;
 mod notifier;
 mod poll;
 mod preflight;
+mod resume;
 mod router;
 mod routes;
 mod state;
@@ -45,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         shutdown_tx.subscribe(),
     );
+
+    // Pick up songs whose poll loop died with the previous process.
+    resume::resume_in_flight(pool.clone(), suno_bridge.clone(), events_tx.clone()).await;
 
     let app = router::build(&cfg, pool, suno_bridge, events_tx).await?;
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

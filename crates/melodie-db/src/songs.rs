@@ -234,6 +234,49 @@ pub async fn delete(pool: &SqlitePool, song_id: SongId) -> Result<u64, DbError> 
     Ok(res.rows_affected())
 }
 
+/// Songs whose poll task should still be running but isn't (process restart).
+/// Returns `(SongId, clip_ids)` so the caller can respawn `poll::spawn`.
+/// Clip-less rows are returned with an empty `clip_ids` so the caller can
+/// mark them failed — they can't be polled and would otherwise stay stuck.
+pub async fn list_in_flight(
+    pool: &SqlitePool,
+) -> Result<Vec<(SongId, Vec<String>)>, DbError> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        song_id: String,
+        clip_id: Option<String>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT s.id AS song_id, c.id AS clip_id \
+         FROM songs s \
+         LEFT JOIN clips c ON c.song_id = s.id \
+         WHERE s.status IN ('pending', 'generating') \
+         ORDER BY s.created_at, c.variant_index",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut grouped: Vec<(SongId, Vec<String>)> = Vec::new();
+    for r in rows {
+        let sid = SongId(parse_uuid(&r.song_id)?);
+        match grouped.last_mut() {
+            Some((existing_id, clips)) if *existing_id == sid => {
+                if let Some(c) = r.clip_id {
+                    clips.push(c);
+                }
+            }
+            _ => {
+                let mut clips = Vec::new();
+                if let Some(c) = r.clip_id {
+                    clips.push(c);
+                }
+                grouped.push((sid, clips));
+            }
+        }
+    }
+    Ok(grouped)
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct SongWithOwnerRow {
     id: String,
