@@ -3,17 +3,34 @@ import {
   applySongEvent,
   deleteSong as deleteSongApi,
   fetchAdminSongs,
+  fetchMyProposedClips,
   renameSong as renameSongApi,
   type AdminSong,
+  type Features,
   type SongEvent,
 } from '../lib/api';
 import SongCard from './SongCard';
 
-export default function AdminFeed() {
+interface Props {
+  features: Features;
+}
+
+export default function AdminFeed({ features }: Props) {
   const [songs, setSongs] = useState<AdminSong[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [proposedClipIds, setProposedClipIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
+
+  const handleClubProposed = useCallback((clipId: string) => {
+    setProposedClipIds((prev) => {
+      const next = new Set(prev);
+      next.add(clipId);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(
     async (showSpinner = false) => {
@@ -34,6 +51,11 @@ export default function AdminFeed() {
 
   useEffect(() => {
     refresh();
+    fetchMyProposedClips()
+      .then((ids) => setProposedClipIds(new Set(ids)))
+      .catch(() => {
+        // Non-critical (see MelodieApp).
+      });
     // Pick up new songs from other users without manual refresh. Per-card
     // SSE handles status changes for songs we already know about; only
     // *new* songs need polling.
@@ -105,6 +127,9 @@ export default function AdminFeed() {
             <SongCard
               key={song.id}
               song={song}
+              features={features}
+              proposedClipIds={proposedClipIds}
+              onClubProposed={handleClubProposed}
               owner={song.owner.display_name}
               onUpdate={handleUpdate}
               onDelete={handleDelete}

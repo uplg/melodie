@@ -39,6 +39,21 @@ pub struct UserView {
     pub role: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MeView {
+    #[serde(flatten)]
+    pub user: UserView,
+    pub features: Features,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Features {
+    /// `true` when `HOMIE_PUSH_TOKEN` is set on the server — the UI shows a
+    /// "Push to live" button on each playable clip and `POST
+    /// /api/clips/{id}/push-to-live` is enabled.
+    pub push_to_live: bool,
+}
+
 impl From<&User> for UserView {
     fn from(u: &User) -> Self {
         Self {
@@ -123,8 +138,16 @@ async fn logout(session: Session) -> ApiResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn me(AuthUser(user): AuthUser) -> Json<UserView> {
-    Json(UserView::from(&user))
+async fn me(
+    State(state): axum::extract::State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Json<MeView> {
+    Json(MeView {
+        user: UserView::from(&user),
+        features: Features {
+            push_to_live: state.homie_push.is_some(),
+        },
+    })
 }
 
 // --- helpers ---

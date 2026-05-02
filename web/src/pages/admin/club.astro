@@ -1,46 +1,40 @@
 ---
-import Layout from '../layouts/Layout.astro';
-import { fetchMe } from '../lib/api';
-import AdminPanel from '../islands/AdminPanel.tsx';
+import Layout from '../../layouts/Layout.astro';
+import { fetchMe } from '../../lib/api';
+import AdminClub from '../../islands/AdminClub.tsx';
 
 const me = await fetchMe(Astro.request);
 if (!me) return Astro.redirect('/login');
 if (me.role !== 'admin') return Astro.redirect('/app');
 ---
 
-<Layout title="Admin — Melodie">
+<Layout title="Club — Melodie admin">
   <header
     class="sticky top-0 z-10 border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50/80 dark:bg-neutral-950/80 backdrop-blur"
   >
     <div class="mx-auto max-w-3xl flex items-center justify-between px-6 py-3">
       <div class="flex items-baseline gap-3">
         <h1 class="text-lg font-semibold tracking-tight">Melodie</h1>
-        <span class="text-sm text-neutral-500">/ admin</span>
+        <span class="text-sm text-neutral-500">/ admin / club</span>
       </div>
       <div class="flex items-center gap-2">
+        <a
+          href="/admin"
+          class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
+        >
+          ← Admin
+        </a>
         <a
           href="/admin/feed"
           class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
         >
           Feed
         </a>
-        <a
-          href="/admin/club"
-          class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
-        >
-          Club
-        </a>
-        <a
-          href="/app"
-          class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
-        >
-          ← App
-        </a>
       </div>
     </div>
   </header>
 
   <main class="mx-auto max-w-3xl px-6 py-8">
-    <AdminPanel client:load />
+    <AdminClub client:load />
   </main>
 </Layout>

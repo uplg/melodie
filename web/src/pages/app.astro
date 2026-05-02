@@ -44,7 +44,7 @@ if (!me) return Astro.redirect('/login');
   </header>
 
   <main class="mx-auto max-w-3xl px-6 py-8">
-    <MelodieApp client:load />
+    <MelodieApp client:load features={me.features} />
   </main>
 
   <script is:inline>

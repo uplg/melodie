@@ -32,7 +32,9 @@ pub async fn resume_in_flight(
         return;
     }
 
-    let state = AppState::new(pool.clone(), suno, events);
+    // resume runs background polling for in-flight songs only — it never
+    // serves HTTP, so the homie-push bridge can stay None here.
+    let state = AppState::new(pool.clone(), suno, events, None);
     let mut respawned = 0usize;
     let mut buried = 0usize;
 

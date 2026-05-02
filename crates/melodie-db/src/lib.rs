@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 
 pub mod clips;
+pub mod club;
 pub mod invites;
 pub mod quota;
 pub mod songs;

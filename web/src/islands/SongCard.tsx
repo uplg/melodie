@@ -1,8 +1,21 @@
 import { useEffect, useState } from 'react';
-import { fetchSong, type Clip, type Song, type SongEvent } from '../lib/api';
+import {
+  fetchSong,
+  proposeClipForClub,
+  pushClipToLive,
+  type Clip,
+  type Features,
+  type Song,
+  type SongEvent,
+} from '../lib/api';
 
 interface Props {
   song: Song;
+  features: Features;
+  /** Set of clip ids the current user has already proposed for the club. */
+  proposedClipIds: ReadonlySet<string>;
+  /** Called optimistically when the user proposes a new clip. */
+  onClubProposed: (clipId: string) => void;
   onUpdate: (ev: SongEvent) => void;
   onDelete: (id: string) => void;
   /** Async rename — parent owns the API call and updates its state. */
@@ -14,7 +27,16 @@ interface Props {
   owner?: string;
 }
 
-export default function SongCard({ song, onUpdate, onDelete, onRename, owner }: Props) {
+export default function SongCard({
+  song,
+  features,
+  proposedClipIds,
+  onClubProposed,
+  onUpdate,
+  onDelete,
+  onRename,
+  owner,
+}: Props) {
   // Subscribe to live updates while the song is still in flight. EventSource
   // is same-origin (proxied via /api/*), so cookies ride along automatically.
   useEffect(() => {
@@ -179,7 +201,17 @@ export default function SongCard({ song, onUpdate, onDelete, onRename, owner }: 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         {[0, 1].map((idx) => {
           const clip = song.clips.find((c) => c.variant_index === idx);
-          return <ClipSlot key={idx} index={idx} clip={clip} title={song.title} />;
+          return (
+            <ClipSlot
+              key={idx}
+              index={idx}
+              clip={clip}
+              title={song.title}
+              features={features}
+              alreadyProposed={clip ? proposedClipIds.has(clip.id) : false}
+              onClubProposed={onClubProposed}
+            />
+          );
         })}
       </div>
     </li>
@@ -190,10 +222,16 @@ function ClipSlot({
   index,
   clip,
   title,
+  features,
+  alreadyProposed,
+  onClubProposed,
 }: {
   index: number;
   clip: Clip | undefined;
   title: string | null;
+  features: Features;
+  alreadyProposed: boolean;
+  onClubProposed: (clipId: string) => void;
 }) {
   if (!clip) {
     return (
@@ -225,18 +263,118 @@ function ClipSlot({
             src={audioUrl}
             className="w-full h-10"
           />
-          <a
-            href={audioUrl}
-            download={downloadName}
-            className="inline-block text-xs text-neutral-700 dark:text-neutral-300 underline"
-          >
-            Download MP3
-          </a>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+            <a
+              href={audioUrl}
+              download={downloadName}
+              className="text-neutral-700 dark:text-neutral-300 underline"
+            >
+              Download MP3
+            </a>
+            {features.push_to_live && (
+              <PushToLiveButton clipId={clip.id} />
+            )}
+            <ClubProposeButton
+              clipId={clip.id}
+              alreadyProposed={alreadyProposed}
+              onClubProposed={onClubProposed}
+            />
+          </div>
         </>
       ) : (
         <div className="h-10 rounded bg-neutral-100 dark:bg-neutral-800 animate-pulse" />
       )}
     </div>
+  );
+}
+
+function ClubProposeButton({
+  clipId,
+  alreadyProposed,
+  onClubProposed,
+}: {
+  clipId: string;
+  alreadyProposed: boolean;
+  onClubProposed: (clipId: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(alreadyProposed);
+
+  if (done) {
+    return <span className="text-emerald-700 dark:text-emerald-400">Proposed for club ✓</span>;
+  }
+
+  const handleClick = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await proposeClipForClub(clipId);
+      setDone(true);
+      onClubProposed(clipId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'propose failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy}
+        className="text-neutral-700 dark:text-neutral-300 underline disabled:opacity-50"
+      >
+        {busy ? 'Proposing…' : 'Propose for club'}
+      </button>
+      {error && (
+        <span className="text-red-600 dark:text-red-400" role="alert">
+          · {error}
+        </span>
+      )}
+    </>
+  );
+}
+
+function PushToLiveButton({ clipId }: { clipId: string }) {
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+
+  const handleClick = async () => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const res = await pushClipToLive(clipId);
+      if (res.position === 0 || res.position === null) {
+        setFeedback('▶ playing now on live');
+      } else {
+        setFeedback(`queued #${res.position} on live`);
+      }
+    } catch (e) {
+      setFeedback(e instanceof Error ? e.message : 'push failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy}
+        className="text-neutral-700 dark:text-neutral-300 underline disabled:opacity-50"
+      >
+        {busy ? 'Pushing…' : 'Push to live'}
+      </button>
+      {feedback && (
+        <span className="text-neutral-500" role="status">
+          · {feedback}
+        </span>
+      )}
+    </>
   );
 }
 

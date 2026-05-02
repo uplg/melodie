@@ -1,0 +1,25 @@
+---
+interface Props {
+  size?: 'sm' | 'md' | 'lg';
+  href?: string | null;
+  class?: string;
+}
+
+const { size = 'md', href = null, class: className = '' } = Astro.props;
+
+const sizeClass = {
+  sm: 'text-lg',
+  md: 'text-3xl',
+  lg: 'text-4xl',
+}[size];
+
+const wordmarkClass = `font-semibold tracking-tight ${sizeClass} ${className}`;
+---
+
+{href ? (
+  <a href={href} class={`${wordmarkClass} no-underline text-neutral-900 dark:text-neutral-100`}>
+    Melodie
+  </a>
+) : (
+  <span class={wordmarkClass}>Melodie</span>
+)}

@@ -60,9 +60,25 @@ live:
     echo "▶ building frontend (astro build)…"
     (cd web && bun run build)
 
+    LIVE_URL_FILE="${MELODIE_URL_FILE:-$HOME/.melodie/live_url}"
+    mkdir -p "$(dirname "$LIVE_URL_FILE")"
+
     echo "▶ starting api + web (prod) + cloudflared…"
-    trap 'kill 0' EXIT
+    echo "▶ live URL will be written to $LIVE_URL_FILE for homie's !melodie"
+    trap 'rm -f "$LIVE_URL_FILE"; kill 0' EXIT
     ./target/release/melodie-api &
     (cd web && HOST=127.0.0.1 PORT=3000 node dist/server/entry.mjs) &
-    cloudflared tunnel --url http://localhost:3000 &
+    cloudflared tunnel --url http://localhost:3000 2>&1 | awk -v file="$LIVE_URL_FILE" '
+      { print; fflush() }
+      !wrote && match($0, /https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com/) {
+        url = substr($0, RSTART, RLENGTH)
+        tmp = file ".tmp"
+        printf "%s\n", url > tmp
+        close(tmp)
+        system("mv -f \"" tmp "\" \"" file "\"")
+        printf "▶ live URL written: %s\n", url
+        fflush()
+        wrote = 1
+      }
+    ' &
     wait

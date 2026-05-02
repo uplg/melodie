@@ -1,5 +1,6 @@
 ---
 import Layout from '../layouts/Layout.astro';
+import Wordmark from '../components/Wordmark.astro';
 import { fetchMe } from '../lib/api';
 
 const me = await fetchMe(Astro.request);
@@ -7,7 +8,11 @@ if (me) return Astro.redirect('/app');
 ---
 
 <Layout title="Sign in — Melodie">
-  <main class="mx-auto max-w-md px-6 py-16">
+  <main class="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-16">
+    <header class="mb-10 text-center">
+      <Wordmark size="lg" />
+    </header>
+
     <h1 class="text-2xl font-semibold tracking-tight">Sign in</h1>
     <p class="mt-2 text-sm text-neutral-600 dark:text-neutral-400">
       Welcome back.

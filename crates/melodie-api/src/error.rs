@@ -26,6 +26,9 @@ pub enum ApiError {
     #[error("rate limited")]
     TooManyRequests,
 
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error(transparent)]
     Db(#[from] melodie_db::DbError),
 
@@ -48,6 +51,7 @@ impl ApiError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
             Self::Db(_) | Self::Session(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }

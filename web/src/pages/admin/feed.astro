@@ -25,6 +25,12 @@ if (me.role !== 'admin') return Astro.redirect('/app');
           ← Admin
         </a>
         <a
+          href="/admin/club"
+          class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
+        >
+          Club
+        </a>
+        <a
           href="/app"
           class="text-sm rounded-md border border-neutral-300 dark:border-neutral-700 px-2.5 py-1 hover:bg-neutral-100 dark:hover:bg-neutral-900"
         >
@@ -35,6 +41,6 @@ if (me.role !== 'admin') return Astro.redirect('/app');
   </header>
 
   <main class="mx-auto max-w-3xl px-6 py-8">
-    <AdminFeed client:load />
+    <AdminFeed client:load features={me.features} />
   </main>
 </Layout>

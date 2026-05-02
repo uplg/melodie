@@ -1,10 +1,13 @@
-import type { Song, SongEvent } from '../lib/api';
+import type { Features, Song, SongEvent } from '../lib/api';
 import SongCard from './SongCard';
 
 interface Props {
   songs: Song[];
   loading: boolean;
   error: string | null;
+  features: Features;
+  proposedClipIds: ReadonlySet<string>;
+  onClubProposed: (clipId: string) => void;
   onUpdate: (ev: SongEvent) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void>;
@@ -14,6 +17,9 @@ export default function SongList({
   songs,
   loading,
   error,
+  features,
+  proposedClipIds,
+  onClubProposed,
   onUpdate,
   onDelete,
   onRename,
@@ -48,6 +54,9 @@ export default function SongList({
         <SongCard
           key={song.id}
           song={song}
+          features={features}
+          proposedClipIds={proposedClipIds}
+          onClubProposed={onClubProposed}
           onUpdate={onUpdate}
           onDelete={onDelete}
           onRename={onRename}

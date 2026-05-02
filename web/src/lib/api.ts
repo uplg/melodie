@@ -11,11 +11,17 @@
 
 const API_BACKEND = import.meta.env.API_INTERNAL ?? 'http://127.0.0.1:8080';
 
+export interface Features {
+  /** When `true`, the UI shows a "Push to live" button on each playable clip. */
+  push_to_live: boolean;
+}
+
 export interface User {
   id: string;
   email: string;
   display_name: string;
   role: 'admin' | 'member';
+  features: Features;
 }
 
 export type SongStatus = 'pending' | 'generating' | 'complete' | 'failed';
@@ -95,6 +101,75 @@ export async function deleteSong(id: string): Promise<void> {
   if (!res.ok && res.status !== 204) {
     throw new Error(`deleteSong failed: ${res.status}`);
   }
+}
+
+export interface PushToLiveResult {
+  title: string | null;
+  position: number | null;
+}
+
+export async function proposeClipForClub(
+  id: string,
+  note?: string
+): Promise<{ created: boolean }> {
+  const res = await fetch(`/api/clips/${id}/club`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ note: note ?? null }),
+  });
+  if (!res.ok) {
+    const body = await res
+      .json()
+      .catch(() => null as { error?: { message?: string } } | null);
+    throw new Error(body?.error?.message ?? `proposeClipForClub failed: ${res.status}`);
+  }
+  return (await res.json()) as { created: boolean };
+}
+
+export async function fetchMyProposedClips(): Promise<string[]> {
+  const res = await fetch('/api/club/proposed');
+  if (!res.ok) throw new Error(`fetchMyProposedClips failed: ${res.status}`);
+  const body = (await res.json()) as { proposed_clip_ids: string[] };
+  return body.proposed_clip_ids;
+}
+
+export interface AdminClubProposal {
+  id: number;
+  clip_id: string;
+  note: string | null;
+  created_at: string;
+  song_id: string;
+  song_title: string | null;
+  variant_index: number;
+  clip_duration_s: number | null;
+  clip_image_url: string | null;
+  clip_status: string;
+  proposer: { id: string; display_name: string };
+  owner: { id: string; display_name: string };
+}
+
+export async function fetchAdminClubProposals(): Promise<AdminClubProposal[]> {
+  const res = await fetch('/api/admin/club');
+  if (!res.ok) throw new Error(`fetchAdminClubProposals failed: ${res.status}`);
+  return (await res.json()) as AdminClubProposal[];
+}
+
+export async function dismissClubProposal(id: number): Promise<void> {
+  const res = await fetch(`/api/admin/club/${id}`, { method: 'DELETE' });
+  if (!res.ok && res.status !== 204) {
+    throw new Error(`dismissClubProposal failed: ${res.status}`);
+  }
+}
+
+export async function pushClipToLive(id: string): Promise<PushToLiveResult> {
+  const res = await fetch(`/api/clips/${id}/push-to-live`, { method: 'POST' });
+  if (!res.ok) {
+    const body = await res
+      .json()
+      .catch(() => null as { error?: { message?: string } } | null);
+    throw new Error(body?.error?.message ?? `pushClipToLive failed: ${res.status}`);
+  }
+  return (await res.json()) as PushToLiveResult;
 }
 
 export async function renameSong(id: string, title: string): Promise<Song> {

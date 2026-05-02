@@ -2,18 +2,27 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   applySongEvent,
   deleteSong as deleteSongApi,
+  fetchMyProposedClips,
   fetchSongs,
   renameSong as renameSongApi,
+  type Features,
   type Song,
   type SongEvent,
 } from '../lib/api';
 import CreatePanel from './CreatePanel';
 import SongList from './SongList';
 
-export default function MelodieApp() {
+interface Props {
+  features: Features;
+}
+
+export default function MelodieApp({ features }: Props) {
   const [songs, setSongs] = useState<Song[]>([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
+  const [proposedClipIds, setProposedClipIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -29,9 +38,25 @@ export default function MelodieApp() {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    fetchMyProposedClips()
+      .then((ids) => {
+        if (!cancelled) setProposedClipIds(new Set(ids));
+      })
+      .catch(() => {
+        // Non-critical: the worst case is the user re-proposes a clip and the
+        // backend silently no-ops it (idempotent UNIQUE constraint).
+      });
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  const handleClubProposed = useCallback((clipId: string) => {
+    setProposedClipIds((prev) => {
+      const next = new Set(prev);
+      next.add(clipId);
+      return next;
+    });
   }, []);
 
   const handleCreated = useCallback((song: Song) => {
@@ -68,6 +93,9 @@ export default function MelodieApp() {
         songs={songs}
         loading={loading}
         error={listError}
+        features={features}
+        proposedClipIds={proposedClipIds}
+        onClubProposed={handleClubProposed}
         onUpdate={handleUpdate}
         onDelete={handleDelete}
         onRename={handleRename}

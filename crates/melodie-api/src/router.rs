@@ -34,7 +34,8 @@ pub async fn build(
         .with_name("melodie.sid")
         .with_expiry(Expiry::OnInactivity(Duration::days(30)));
 
-    let state = AppState::new(pool, suno, events);
+    let homie_push = cfg.homie_push.clone().map(Arc::new);
+    let state = AppState::new(pool, suno, events, homie_push);
 
     Ok(Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
