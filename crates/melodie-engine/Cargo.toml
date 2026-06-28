@@ -1,0 +1,26 @@
+[package]
+name = "melodie-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Local HeartMuLa inference engine (pure-Rust, candle) that replaces the
+# Suno bridge. Ported from ../heartlib-mlx (HeartMuLa LM + HeartCodec).
+# See crate docs (src/lib.rs) for the phased port plan.
+
+[dependencies]
+# ML — candle (Metal backend enabled later, in P1, via the "metal" feature)
+candle-core = "0.11"
+candle-nn = "0.11"
+
+# tokenizer (Llama-3 tokenizer.json), audio i/o
+tokenizers = "0.23"
+hound = "3.5"
+
+# shared workspace deps
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -12,7 +12,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use melodie_core::model::Role;
-use rand::RngCore;
+use rand::Rng;
 use sqlx::SqlitePool;
 
 pub async fn ensure_bootstrap_invite(

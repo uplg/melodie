@@ -8,7 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use melodie_core::ids::UserId;
 use melodie_core::model::Role;
 use melodie_db::invites::InviteListRow;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -1,0 +1,8 @@
+{
+  "t_codes": 16,
+  "num_steps": 10,
+  "guidance_scale": 1.25,
+  "noise_seed": 1234,
+  "noise_call_index": 0,
+  "latent_dim": 256
+}
