@@ -46,8 +46,11 @@ fn main() -> Result<()> {
     let codes = {
         let w = LmWeights::load(Path::new(LM), &dev)?;
         let lm = HeartMuLaLm::load(&w, &dev)?;
-        println!("generating up to {frames} frames...");
-        lm.generate_codes(&p.tokens, &p.mask, Some(p.muq_idx), 1.5, frames, 50, 1.0)?
+        drop(w); // free the 15 GB f32 source; the model keeps only its bf16 copy (~7.5 GB)
+        let muq = if std::env::var("MELODIE_NOMUQ").is_ok() { None } else { Some(p.muq_idx) };
+        let cfg: f64 = std::env::var("MELODIE_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
+        println!("generating up to {frames} frames (muq={muq:?}, cfg={cfg})...");
+        lm.generate_codes(&p.tokens, &p.mask, muq, cfg, frames, 50, 1.0)?
     };
     let t = codes.dim(1)?;
     println!("generated codes [8, {t}]");

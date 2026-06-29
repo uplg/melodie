@@ -38,14 +38,18 @@ fn main() -> Result<()> {
     let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
     println!("device: {dev:?}");
     let frames = 24usize;
-    let (s, ncb) = (8usize, 8usize);
+    let s: usize = std::env::var("MELODIE_PROMPT_LEN").ok().and_then(|x| x.parse().ok()).unwrap_or(8);
+    let ncb = 8usize;
 
     println!("loading HeartMuLa LM (15 GB)...");
     let codes = {
         let w = LmWeights::load(Path::new(LM), &dev)?;
         let lm = HeartMuLaLm::load(&w, &dev)?;
-        // synthetic text-only prompt
-        let text_ids = [128000i64, 100, 200, 300, 400, 500, 600, 128001];
+        drop(w); // free the 15 GB f32 source; the model keeps only its bf16 copy (~7.5 GB)
+        // synthetic text-only prompt of length s (BOS … EOS)
+        let text_ids: Vec<i64> = (0..s)
+            .map(|i| if i == 0 { 128000 } else if i == s - 1 { 128001 } else { (100 + i) as i64 })
+            .collect();
         let mut tg = vec![0i64; s * (ncb + 1)];
         let mut mg = vec![0i64; s * (ncb + 1)];
         for i in 0..s {
@@ -54,9 +58,10 @@ fn main() -> Result<()> {
         }
         let tokens = Tensor::from_vec(tg, (1, s, ncb + 1), &dev)?;
         let mask = Tensor::from_vec(mg, (1, s, ncb + 1), &dev)?;
-        println!("generating {frames} frames (multi-frame loop)...");
+        let cfg: f64 = std::env::var("MELODIE_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        println!("generating {frames} frames (multi-frame loop, cfg={cfg})...");
         let t0 = std::time::Instant::now();
-        let c = lm.generate_codes(&tokens, &mask, None, 1.0, frames, 50, 1.0)?;
+        let c = lm.generate_codes(&tokens, &mask, None, cfg, frames, 50, 1.0)?;
         let el = t0.elapsed().as_secs_f32();
         println!("  generation: {el:.1} s ({:.0} ms/frame)", el * 1000.0 / frames as f32);
         c
