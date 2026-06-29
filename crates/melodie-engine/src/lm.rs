@@ -317,6 +317,7 @@ pub struct HeartMuLaLm {
     codebook0_head: Lin,
     audio_head: Tensor, // [ncb-1, D, V]
     muq_bias: Tensor,   // muq_linear bias (= muq_linear(zeros), the MuQ-slot embedding)
+    uncond_text: Tensor, // unconditional_text_embedding [1, D] (CFG null token)
     cfg: HeartMuLaConfig,
 }
 
@@ -332,6 +333,7 @@ impl HeartMuLaLm {
             codebook0_head: Lin::load(w, "codebook0_head")?,
             audio_head: w.t("audio_head")?,
             muq_bias: w.t("muq_linear.bias")?,
+            uncond_text: w.t("unconditional_text_embedding.weight")?,
             cfg,
         })
     }
@@ -345,14 +347,26 @@ impl HeartMuLaLm {
         Ok(self.audio_embeddings.index_select(&idx, 0)?.reshape((b, s, d))?)
     }
 
+    /// Embed a single token id duplicated across a batch of 2 (CFG): -> [2,1,D].
+    fn embed_audio_dup(&self, codebook: usize, token: u32) -> Result<Tensor> {
+        let t = Tensor::from_vec(vec![token as i64; 2], (2, 1), &self.text_embeddings.device().clone())?;
+        self.embed_audio(codebook, &t)
+    }
+
     /// Embed a `[B,S,ncb+1]` token grid (text in last channel) and mask-sum to `[B,S,D]`.
-    fn embed_and_sum(&self, tokens: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn embed_and_sum(&self, tokens: &Tensor, mask: &Tensor, uncond: bool) -> Result<Tensor> {
         let (b, s, _) = tokens.dims3()?;
         let ncb = self.cfg.audio_num_codebooks;
         let d = self.cfg.backbone.embed_dim;
         // text channel
         let text_idx = tokens.narrow(2, ncb, 1)?.squeeze(2)?.to_dtype(DType::U32)?.flatten_all()?;
-        let text = self.text_embeddings.index_select(&text_idx, 0)?.reshape((b, s, 1, d))?;
+        let mut text = self.text_embeddings.index_select(&text_idx, 0)?.reshape((b, s, 1, d))?;
+        if uncond {
+            // CFG: the uncond half (second half of the batch) uses the null text embedding
+            let actual = b / 2;
+            let ut = self.uncond_text.reshape((1, 1, 1, d))?.broadcast_as((b - actual, s, 1, d))?.contiguous()?;
+            text = Tensor::cat(&[&text.narrow(0, 0, actual)?, &ut], 0)?;
+        }
         // audio channels with per-codebook offset
         let offsets: Vec<f32> = (0..ncb).map(|c| (c * self.cfg.audio_vocab_size) as f32).collect();
         let offsets = Tensor::from_vec(offsets, (1, 1, ncb), tokens.device())?;
@@ -368,7 +382,7 @@ impl HeartMuLaLm {
     pub fn backbone_c0(&self, tokens: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
         let dev = tokens.device();
         let s = tokens.dim(1)?;
-        let h = self.embed_and_sum(tokens, mask)?; // [B,S,D]
+        let h = self.embed_and_sum(tokens, mask, false)?; // [B,S,D]
         let pos: Vec<u32> = (0..s as u32).collect();
         let pos = Tensor::from_vec(pos, s, dev)?;
         let m = causal_mask(s, dev)?;
@@ -460,39 +474,107 @@ impl HeartMuLaLm {
         Ok(samples)
     }
 
+    /// CFG `generate_frame`: doubles the prompt (cond + uncond null-text), guides each
+    /// codebook's logits `uncond + (cond-uncond)*cfg`, then samples. Returns
+    /// (samples, c0_guided_logits `[1,V]`, ci_guided_logits `[7][1,V]`).
+    pub fn generate_frame_cfg(&self, tokens: &Tensor, mask: &Tensor, cfg: f64, topk: usize, temperature: f64, uniforms: &Tensor) -> Result<(Vec<u32>, Tensor, Vec<Tensor>)> {
+        let dev = tokens.device();
+        let s = tokens.dim(1)?;
+        let tokens2 = Tensor::cat(&[tokens, tokens], 0)?;
+        let mask2 = Tensor::cat(&[mask, mask], 0)?;
+        let h0 = self.embed_and_sum(&tokens2, &mask2, true)?; // [2,S,D]
+        let pos = Tensor::from_vec((0..s as u32).collect::<Vec<_>>(), s, dev)?;
+        let mut caches = self.backbone.fresh_caches();
+        let out = self.backbone.forward(&h0, &pos, &causal_mask(s, dev)?, &mut caches)?;
+        let last_h = out.narrow(1, s - 1, 1)?.squeeze(1)?; // [2,D]
+        self.sample_frame_cfg(&last_h, cfg, topk, temperature, uniforms)
+    }
+
+    fn sample_frame_cfg(&self, last_h: &Tensor, cfg: f64, topk: usize, temperature: f64, uniforms: &Tensor) -> Result<(Vec<u32>, Tensor, Vec<Tensor>)> {
+        let dev = last_h.device();
+        let ncb = self.cfg.audio_num_codebooks;
+        let guide = |logits: &Tensor| -> Result<Tensor> {
+            let cond = logits.narrow(0, 0, 1)?;
+            let uncond = logits.narrow(0, 1, 1)?;
+            Ok((&uncond + ((cond - &uncond)? * cfg)?)?)
+        };
+
+        let c0_guided = guide(&self.codebook0_head.fwd(last_h)?)?; // [1,V]
+        let mut samples = Vec::with_capacity(ncb);
+        let mut ci_guided = Vec::new();
+        samples.push(sample_topk(&c0_guided, topk, temperature, &uniforms.narrow(0, 0, 1)?)?);
+
+        let mut caches = self.decoder.fresh_caches();
+        let c0_emb = self.embed_audio_dup(0, samples[0])?; // [2,1,D]
+        let curr_h = Tensor::cat(&[&last_h.unsqueeze(1)?, &c0_emb], 1)?; // [2,2,D]
+        let pos = Tensor::from_vec(vec![0u32, 1], 2, dev)?;
+        let dh = self.decoder.forward(&self.projection.fwd(&curr_h)?, &pos, &causal_mask(2, dev)?, &mut caches)?;
+        let mut logits = self.ci_logits(&dh, 0)?; // [2,V] codebook 1
+
+        for cb in 1..ncb {
+            let g = guide(&logits)?;
+            ci_guided.push(g.clone());
+            let sv = sample_topk(&g, topk, temperature, &uniforms.narrow(0, cb, 1)?)?;
+            samples.push(sv);
+            if cb == ncb - 1 {
+                break;
+            }
+            let emb = self.embed_audio_dup(cb, sv)?;
+            let pos = Tensor::from_vec(vec![(cb + 1) as u32], 1, dev)?;
+            let m = Tensor::zeros((1, cb + 2), DType::F32, dev)?;
+            let dh = self.decoder.forward(&self.projection.fwd(&emb)?, &pos, &m, &mut caches)?;
+            logits = self.ci_logits(&dh, cb)?;
+        }
+        Ok((samples, c0_guided, ci_guided))
+    }
+
     /// Autoregressive multi-frame generation: prompt → codes `[ncb, T]`. Backbone
     /// KV cache persists across frames; each frame feeds the previous frame's audio
     /// tokens; stops at EOS (codebook-0 ≥ 8193) or `max_frames`. RNG is self-generated.
-    pub fn generate_codes(&self, tokens: &Tensor, mask: &Tensor, muq_idx: Option<usize>, max_frames: usize, topk: usize, temperature: f64) -> Result<Tensor> {
+    pub fn generate_codes(&self, tokens: &Tensor, mask: &Tensor, muq_idx: Option<usize>, cfg_scale: f64, max_frames: usize, topk: usize, temperature: f64) -> Result<Tensor> {
         let dev = tokens.device();
         let ncb = self.cfg.audio_num_codebooks;
         let v = self.cfg.audio_vocab_size;
+        let d = self.cfg.backbone.embed_dim;
         let eos = 8193u32;
+        let cfg = cfg_scale > 1.0; // B=2 (cond+uncond) when guiding
         let s = tokens.dim(1)?;
         let mut bcaches = self.backbone.fresh_caches();
 
-        // frame 0: full prompt forward (with MuQ-slot embedding scattered in)
-        let mut h0 = self.embed_and_sum(tokens, mask)?;
+        // frame 0: prompt forward (doubled for CFG; MuQ slot scattered per row)
+        let (t0, m0) = if cfg {
+            (Tensor::cat(&[tokens, tokens], 0)?, Tensor::cat(&[mask, mask], 0)?)
+        } else {
+            (tokens.clone(), mask.clone())
+        };
+        let mut h0 = self.embed_and_sum(&t0, &m0, cfg)?;
         if let Some(idx) = muq_idx {
-            let d = self.cfg.backbone.embed_dim;
-            let mq = self.muq_bias.reshape((1, 1, d))?;
+            let mq = if cfg {
+                Tensor::cat(&[&self.muq_bias.reshape((1, 1, d))?, &self.uncond_text.reshape((1, 1, d))?], 0)?
+            } else {
+                self.muq_bias.reshape((1, 1, d))?
+            };
             let before = h0.narrow(1, 0, idx)?;
             let after = h0.narrow(1, idx + 1, s - idx - 1)?;
             h0 = Tensor::cat(&[&before, &mq, &after], 1)?;
         }
         let pos0 = Tensor::from_vec((0..s as u32).collect::<Vec<_>>(), s, dev)?;
         let out = self.backbone.forward(&h0, &pos0, &causal_mask(s, dev)?, &mut bcaches)?;
-        let mut last_h = out.narrow(1, s - 1, 1)?.squeeze(1)?;
+        let mut last_h = out.narrow(1, s - 1, 1)?.squeeze(1)?; // [B,D]
 
         let mut frames: Vec<Vec<u32>> = Vec::new();
         let mut pos = s;
         for _ in 0..max_frames {
             let uniforms = Tensor::rand(0f32, 1f32, (ncb, v), dev)?;
-            let frame = self.sample_frame(&last_h, topk, temperature, &uniforms)?;
+            let frame = if cfg {
+                self.sample_frame_cfg(&last_h, cfg_scale, topk, temperature, &uniforms)?.0
+            } else {
+                self.sample_frame(&last_h, topk, temperature, &uniforms)?
+            };
             if frame[0] >= eos {
                 break;
             }
-            // next backbone input: prev frame's audio tokens (text channel empty, audio active)
+            // next input: prev frame's audio tokens (text empty), duplicated for CFG
             let mut grid = vec![0i64; ncb + 1];
             let mut mvec = vec![0i64; ncb + 1];
             for (c, &t) in frame.iter().enumerate() {
@@ -500,16 +582,20 @@ impl HeartMuLaLm {
                 mvec[c] = 1;
             }
             frames.push(frame);
-            let tok_grid = Tensor::from_vec(grid, (1, 1, ncb + 1), dev)?;
-            let mask_t = Tensor::from_vec(mvec, (1, 1, ncb + 1), dev)?;
-            let h_t = self.embed_and_sum(&tok_grid, &mask_t)?;
+            let tg1 = Tensor::from_vec(grid, (1, 1, ncb + 1), dev)?;
+            let mg1 = Tensor::from_vec(mvec, (1, 1, ncb + 1), dev)?;
+            let (tg, mg) = if cfg {
+                (Tensor::cat(&[&tg1, &tg1], 0)?, Tensor::cat(&[&mg1, &mg1], 0)?)
+            } else {
+                (tg1, mg1)
+            };
+            let h_t = self.embed_and_sum(&tg, &mg, false)?;
             let m = Tensor::zeros((1, pos + 1), DType::F32, dev)?;
             let out = self.backbone.forward(&h_t, &Tensor::from_vec(vec![pos as u32], 1, dev)?, &m, &mut bcaches)?;
             last_h = out.narrow(1, 0, 1)?.squeeze(1)?;
             pos += 1;
         }
 
-        // [T][ncb] -> [ncb, T]
         let t = frames.len();
         let mut data = vec![0i64; ncb * t];
         for (fi, f) in frames.iter().enumerate() {

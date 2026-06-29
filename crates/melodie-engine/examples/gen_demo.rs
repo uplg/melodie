@@ -35,7 +35,8 @@ fn write_wav(path: &str, wav: &Tensor) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let dev = Device::Cpu;
+    let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
+    println!("device: {dev:?}");
     let frames = 24usize;
     let (s, ncb) = (8usize, 8usize);
 
@@ -54,7 +55,11 @@ fn main() -> Result<()> {
         let tokens = Tensor::from_vec(tg, (1, s, ncb + 1), &dev)?;
         let mask = Tensor::from_vec(mg, (1, s, ncb + 1), &dev)?;
         println!("generating {frames} frames (multi-frame loop)...");
-        lm.generate_codes(&tokens, &mask, None, frames, 50, 1.0)?
+        let t0 = std::time::Instant::now();
+        let c = lm.generate_codes(&tokens, &mask, None, 1.0, frames, 50, 1.0)?;
+        let el = t0.elapsed().as_secs_f32();
+        println!("  generation: {el:.1} s ({:.0} ms/frame)", el * 1000.0 / frames as f32);
+        c
     }; // LM dropped here, freeing ~15 GB before loading the codec
 
     let t = codes.dim(1)?;

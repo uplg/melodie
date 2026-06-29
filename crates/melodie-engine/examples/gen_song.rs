@@ -47,7 +47,7 @@ fn main() -> Result<()> {
         let w = LmWeights::load(Path::new(LM), &dev)?;
         let lm = HeartMuLaLm::load(&w, &dev)?;
         println!("generating up to {frames} frames...");
-        lm.generate_codes(&p.tokens, &p.mask, Some(p.muq_idx), frames, 50, 1.0)?
+        lm.generate_codes(&p.tokens, &p.mask, Some(p.muq_idx), 1.5, frames, 50, 1.0)?
     };
     let t = codes.dim(1)?;
     println!("generated codes [8, {t}]");

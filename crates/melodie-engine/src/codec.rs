@@ -324,4 +324,23 @@ impl HeartCodec {
             .reshape((b * 2, t2, f / 2))?;
         self.scalar.decode(&latent) // (2, 2T*1920)
     }
+
+    /// Full detokenize for a clip shorter than one segment: pad codes to the
+    /// `duration`-second segment (≈372 frames), flow-match + ScalarModel decode,
+    /// then trim to the original length. Mirrors `HeartCodec.detokenize`
+    /// (modeling_heartcodec.py:96-223) for the single-segment case. `fm_noise` is
+    /// the injected `(1, 2*min_samples, 256)` latent noise.
+    pub fn detokenize(&self, codes: &Tensor, fm_noise: &Tensor, duration: f64, num_steps: usize, gs: f64) -> Result<Tensor> {
+        let t_orig = codes.dim(2)?;
+        let min_samples = (duration * 12.5) as usize;
+        let target_len = (t_orig as f64 / 12.5 * 48000.0) as usize;
+        // tile codes to min_samples (repeat-and-truncate)
+        let mut c = codes.clone();
+        while c.dim(2)? < min_samples {
+            c = Tensor::cat(&[&c, &c], 2)?;
+        }
+        let c = c.narrow(2, 0, min_samples)?;
+        let wav = self.detokenize_segment(&c, fm_noise, num_steps, gs)?; // (2, min_samples*2*1920)
+        Ok(wav.narrow(1, 0, target_len)?) // (2, target_len)
+    }
 }

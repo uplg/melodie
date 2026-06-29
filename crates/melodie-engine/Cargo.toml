@@ -11,9 +11,9 @@ repository.workspace = true
 # See crate docs (src/lib.rs) for the phased port plan.
 
 [dependencies]
-# ML — candle (Metal backend enabled later, in P1, via the "metal" feature)
-candle-core = "0.11"
-candle-nn = "0.11"
+# ML — candle with Metal backend (Apple Silicon GPU)
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
 
 # tokenizer (Llama-3 tokenizer.json), audio i/o
 tokenizers = "0.23"
