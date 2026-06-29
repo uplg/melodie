@@ -211,8 +211,8 @@ impl Attn {
         let v = self.v.fwd(x)?.reshape((b, sx, nkv, dh))?.transpose(1, 2)?.contiguous()?;
         // fused interleaved RoPE (1 kernel vs ~10 hand-rolled ops); cos/sin [Sx, dh/2]
         let rc = rope_cache.index_select(positions, 0)?; // [Sx, dh/2, 2]
-        let cos = rc.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
-        let sin = rc.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
+        let cos = rc.narrow(2, 0, 1)?.squeeze(2)?.to_dtype(q.dtype())?.contiguous()?;
+        let sin = rc.narrow(2, 1, 1)?.squeeze(2)?.to_dtype(q.dtype())?.contiguous()?;
         let q = candle_nn::rotary_emb::rope_i(&q, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope_i(&k, &cos, &sin)?;
         let k = Self::expand_kv(&k, h / nkv)?; // [B,H,Sx,D]
@@ -222,8 +222,11 @@ impl Attn {
         // crucially, it never materialises k^T — the manual path copied the WHOLE KV
         // cache every frame (O(cache) → O(T²) over a song; ~7x slower at cache 500).
         // `do_causal` covers the prompt (Sx>1); a single generated token attends all.
-        let attn = if matches!(q.device(), Device::Metal(_)) {
+        let attn = if matches!(q.device(), Device::Metal(_)) && dh <= 256 {
             // Metal: fused SDPA (no k^T materialisation; scores+softmax+@v in one kernel).
+            // Used for the backbone (head_dim 128, large cache); the depth decoder
+            // (head_dim 384, unsupported by Metal SDPA) falls to the manual path below —
+            // its cache is ≤9 so the k^T copy is negligible there.
             // do_causal covers the prompt (Sx>1); a single generated token attends all.
             candle_nn::ops::sdpa(&q, &k, &v, None, sx > 1, (1.0 / (dh as f64).sqrt()) as f32, 1.0)?
         } else {

@@ -33,7 +33,8 @@ fn write_wav(path: &str, wav: &Tensor) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let dev = Device::Cpu;
+    let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
+    println!("device: {dev:?}");
     let frames: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(80);
 
     let tok = load_tokenizer(TOKENIZER)?;
