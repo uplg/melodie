@@ -9,29 +9,24 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/leonardcherouvrier/melodie"
 
 [workspace.dependencies]
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "process", "net", "sync"] }
-futures-util = "0.3"
 
-# http client (used by suno-client)
+# http client
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 # http server
 axum = { version = "0.8", features = ["macros", "ws"] }
-tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "set-header"] }
-tower-sessions = "0.14" # pinned: tower-sessions-sqlx-store 0.15 still targets tower-sessions-core 0.14
-tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
-tower-governor = "0.7"
+tower-sessions = { version = "0.15", default-features = false, features = ["axum-core", "memory-store"] }
 
 # db
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate", "uuid", "chrono"] } # pinned: tower-sessions-sqlx-store 0.15 requires sqlx ^0.8 (libsqlite3-sys links conflict)
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate", "uuid", "chrono"] }
 
 # serde / errors / time / ids
 serde = { version = "1", features = ["derive"] }
@@ -44,22 +39,11 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 argon2 = "0.5"
 rand = "0.10"
 base64 = "0.22"
-chacha20poly1305 = "0.10"
 time = { version = "0.3", default-features = false, features = ["std", "macros", "serde"] }
-
-# id3 + audio (suno-client uses)
-id3 = "1"
 
 # logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# config
-figment = { version = "0.10", features = ["toml", "env"] }
-
-# openapi (for typed front client)
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-axum = "0.2"
 
 [profile.release]
 lto = "thin"

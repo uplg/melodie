@@ -72,15 +72,15 @@ pub async fn list_for_songs(pool: &SqlitePool, song_ids: &[SongId]) -> Result<Ve
     if song_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; song_ids.len()].join(",");
-    let sql = format!(
-        "SELECT id, song_id, variant_index, status, duration_s, image_url FROM clips WHERE song_id IN ({placeholders}) ORDER BY song_id, variant_index"
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, song_id, variant_index, status, duration_s, image_url FROM clips WHERE song_id IN (",
     );
-    let mut q = sqlx::query_as::<_, ClipRow>(&sql);
+    let mut sep = qb.separated(", ");
     for id in song_ids {
-        q = q.bind(id.to_string());
+        sep.push_bind(id.to_string());
     }
-    let rows = q.fetch_all(pool).await?;
+    qb.push(") ORDER BY song_id, variant_index");
+    let rows: Vec<ClipRow> = qb.build_query_as().fetch_all(pool).await?;
     rows.into_iter().map(ClipRow::into_domain).collect()
 }
 

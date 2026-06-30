@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use melodie_core::authz::{self, Action, Resource};
+use melodie_core::authz::Action;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{ApiError, ApiResult};
-use crate::extract::AuthUser;
+use crate::extract::{AuthUser, require_song_access};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -35,17 +35,7 @@ async fn audio(
     let (clip, owner_id) = melodie_db::clips::find_with_song_owner(&state.db, &clip_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Read,
-        Resource::Song {
-            owner_id,
-            song_id: clip.song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, owner_id, clip.song_id, Action::Read)?;
 
     let path = state.audio_dir.join(format!("{clip_id}.mp3"));
     let exists = tokio::fs::metadata(&path).await.is_ok();
@@ -171,17 +161,7 @@ async fn push_to_live(
     let (clip, owner_id) = melodie_db::clips::find_with_song_owner(&state.db, &clip_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Read,
-        Resource::Song {
-            owner_id,
-            song_id: clip.song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, owner_id, clip.song_id, Action::Read)?;
 
     // Make sure the audio actually exists on disk before we hand homie a URL.
     let path = state.audio_dir.join(format!("{clip_id}.mp3"));

@@ -1,11 +1,12 @@
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
-use melodie_core::ids::UserId;
+use melodie_core::authz::{self, Action, Resource};
+use melodie_core::ids::{SongId, UserId};
 use melodie_core::model::User;
 use tower_sessions::Session;
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 pub const SESSION_USER_KEY: &str = "user_id";
@@ -36,6 +37,22 @@ where
             .await?
             .ok_or(ApiError::Unauthorized)?;
         Ok(AuthUser(user))
+    }
+}
+
+/// Gate `action` on `user`'s access to the song owned by `owner_id`, the
+/// check every song/clip handler needs after loading its row. Owners and
+/// admins pass; everyone else gets [`ApiError::Forbidden`].
+pub fn require_song_access(
+    user: &User,
+    owner_id: UserId,
+    song_id: SongId,
+    action: Action,
+) -> ApiResult<()> {
+    if authz::can(user.role, user.id, action, Resource::Song { owner_id, song_id }) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
     }
 }
 

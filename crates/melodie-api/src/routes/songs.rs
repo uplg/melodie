@@ -9,9 +9,9 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
-use melodie_core::authz::{self, Action, Resource};
+use melodie_core::authz::Action;
 use melodie_core::ids::SongId;
-use melodie_core::model::{Song, SongStatus};
+use melodie_core::model::{Clip, Song, SongStatus};
 use melodie_db::clips::UpsertClip;
 use melodie_db::songs::NewSong;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 use crate::events::SongEvent;
-use crate::extract::AuthUser;
+use crate::extract::{AuthUser, require_song_access};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -73,13 +73,25 @@ pub struct SongView {
     pub clips: Vec<ClipView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClipView {
     pub id: String,
     pub variant_index: i32,
     pub status: String,
     pub duration_s: Option<f64>,
     pub image_url: Option<String>,
+}
+
+impl From<&Clip> for ClipView {
+    fn from(c: &Clip) -> Self {
+        Self {
+            id: c.id.clone(),
+            variant_index: c.variant_index,
+            status: c.status.clone(),
+            duration_s: c.duration_s,
+            image_url: c.image_url.clone(),
+        }
+    }
 }
 
 impl From<&Song> for SongView {
@@ -92,26 +104,11 @@ impl From<&Song> for SongView {
             prompt: s.prompt.clone(),
             language: s.language.clone(),
             model: s.model.clone(),
-            status: match s.status {
-                SongStatus::Pending => "pending".into(),
-                SongStatus::Generating => "generating".into(),
-                SongStatus::Complete => "complete".into(),
-                SongStatus::Failed => "failed".into(),
-            },
+            status: s.status.as_str().to_string(),
             error: s.error.clone(),
             created_at: s.created_at,
             updated_at: s.updated_at,
-            clips: s
-                .clips
-                .iter()
-                .map(|c| ClipView {
-                    id: c.id.clone(),
-                    variant_index: c.variant_index,
-                    status: c.status.clone(),
-                    duration_s: c.duration_s,
-                    image_url: c.image_url.clone(),
-                })
-                .collect(),
+            clips: s.clips.iter().map(ClipView::from).collect(),
         }
     }
 }
@@ -212,17 +209,7 @@ async fn events(
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Read,
-        Resource::Song {
-            owner_id: song.owner_id,
-            song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, song.owner_id, song_id, Action::Read)?;
 
     // Snapshot the current state from DB so the client gets a frame
     // immediately on connect — no waiting for the next poll tick.
@@ -298,17 +285,7 @@ async fn detail(
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Read,
-        Resource::Song {
-            owner_id: song.owner_id,
-            song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, song.owner_id, song_id, Action::Read)?;
     Ok(Json(SongView::from(&song)))
 }
 
@@ -333,17 +310,7 @@ async fn rename(
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Write,
-        Resource::Song {
-            owner_id: song.owner_id,
-            song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, song.owner_id, song_id, Action::Write)?;
     melodie_db::songs::set_title(&state.db, song_id, title).await?;
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
@@ -360,17 +327,7 @@ async fn delete_song(
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Delete,
-        Resource::Song {
-            owner_id: song.owner_id,
-            song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, song.owner_id, song_id, Action::Delete)?;
 
     melodie_db::songs::delete(&state.db, song_id).await?;
     Ok(StatusCode::NO_CONTENT)

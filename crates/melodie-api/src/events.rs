@@ -5,8 +5,10 @@
 //! `routes/songs.rs` forwards them to the React UI. Shapes are part of the
 //! public HTTP API — keep them stable.
 
-use melodie_core::model::{Song, SongStatus};
+use melodie_core::model::Song;
 use serde::Serialize;
+
+use crate::routes::songs::ClipView;
 
 /// Wire event broadcast through the SSE endpoint. Cheap to clone.
 #[derive(Debug, Clone, Serialize)]
@@ -20,41 +22,17 @@ pub struct SongEvent {
     pub progress: Option<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ClipEventView {
-    pub id: String,
-    pub variant_index: i32,
-    pub status: String,
-    pub duration_s: Option<f64>,
-    pub image_url: Option<String>,
-}
+/// Same wire shape as [`ClipView`] — distinct name to keep the SSE payload
+/// readable independent of the REST views module.
+pub type ClipEventView = ClipView;
 
 impl SongEvent {
     pub fn from_song(song: &Song) -> Self {
         Self {
             song_id: song.id.to_string(),
-            status: song_status_str(song.status).to_string(),
+            status: song.status.as_str().to_string(),
             progress: None,
-            clips: song
-                .clips
-                .iter()
-                .map(|c| ClipEventView {
-                    id: c.id.clone(),
-                    variant_index: c.variant_index,
-                    status: c.status.clone(),
-                    duration_s: c.duration_s,
-                    image_url: c.image_url.clone(),
-                })
-                .collect(),
+            clips: song.clips.iter().map(ClipEventView::from).collect(),
         }
-    }
-}
-
-pub fn song_status_str(s: SongStatus) -> &'static str {
-    match s {
-        SongStatus::Pending => "pending",
-        SongStatus::Generating => "generating",
-        SongStatus::Complete => "complete",
-        SongStatus::Failed => "failed",
     }
 }

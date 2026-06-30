@@ -9,9 +9,6 @@ repository.workspace = true
 [dependencies]
 melodie-core = { path = "../melodie-core" }
 sqlx.workspace = true
-tokio.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-tracing.workspace = true

@@ -129,15 +129,18 @@ fn conv1d_chunked(
     Ok(Tensor::cat(&outs, 2)?)
 }
 
+/// Per-chunk audio callback: interleaved-stereo PCM (`l,r,l,r,…`).
+type AudioCb<'a> = dyn FnMut(&[f32]) + 'a;
+
 /// Optional observers passed to [`HeartCodec::detokenize`]. Both are purely observational —
 /// the returned waveform is identical with or without them.
 #[derive(Default)]
 pub struct DetokCb<'a> {
     /// Called `(segments_done, total_segments)` after each segment decodes.
     pub on_seg: Option<&'a mut dyn FnMut(usize, usize)>,
-    /// Called with each newly-FINALISED interleaved-stereo PCM chunk (`l,r,l,r,…`), for
+    /// Called with each newly-FINALISED interleaved-stereo PCM chunk, for
     /// streaming the mp3 out while generation is still running.
-    pub on_audio: Option<&'a mut dyn FnMut(&[f32])>,
+    pub on_audio: Option<&'a mut AudioCb<'a>>,
 }
 
 /// `(2, k)` planar stereo → interleaved `[l0,r0,l1,r1,…]`. Reads each channel separately (the

@@ -27,6 +27,17 @@ pub enum SongStatus {
     Failed,
 }
 
+impl SongStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SongStatus::Pending => "pending",
+            SongStatus::Generating => "generating",
+            SongStatus::Complete => "complete",
+            SongStatus::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Song {
     pub id: SongId,

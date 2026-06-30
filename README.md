@@ -1,33 +1,36 @@
 # Melodie
 
-Self-hosted HeartMuLa wrapper for a small group of friends.
-Designed to run locally on the operator's machine and exposed publicly via
-`cloudflared` only during "live" sessions — keeps the Suno hCaptcha solver
-happy (it needs a real Chrome with a warm browser fingerprint) and avoids
+Self-hosted music generator for a small group of friends, built on a local
+HeartMuLa inference engine. Designed to run on the operator's machine and
+exposed publicly via `cloudflared` only during "live" sessions, avoiding
 running anything 24/7.
 
 ## Stack
 
 - Backend: Rust 2024, axum 0.8, SQLite (sqlx), tower-sessions, argon2id
-- Frontend: Astro 6 SSR (Node) + React 19 islands, TypeScript strict, Tailwind v4
+- Engine: `melodie-engine`, a pure-Rust (candle, Metal backend) port of
+  HeartMuLa — runs generation fully on-device, no upstream API
+- Frontend: Astro 7 SSR (Node) + React 19 islands, TypeScript strict, Tailwind v4
 
 ## Layout
 
 ```
 crates/
-  suno-client/   # vendored Suno HTTP client + auth + hCaptcha (library)
-  melodie-core/  # domain types + traits
-  melodie-db/    # sqlx pool + migrations
-  melodie-api/   # axum binary
-web/             # Astro 6 app
+  melodie-core/   # domain types + traits
+  melodie-db/     # sqlx pool + migrations
+  melodie-engine/ # local HeartMuLa inference engine (candle)
+  melodie-api/    # axum binary
+web/              # Astro 7 app
 ```
 
 ## Prerequisites
 
 - Rust stable (edition 2024 — see `rust-toolchain.toml`)
-- `chromium` or `google-chrome` on `PATH` — required by the Suno hCaptcha solver
+- macOS with Apple Silicon (the engine targets candle's Metal backend)
+- HeartMuLa checkpoints + tokenizer on disk (see `MELODIE_LM_DIR`,
+  `MELODIE_CODEC_DIR`, `MELODIE_TOKENIZER` in `.env.example`)
 - `cloudflared` on `PATH` — only when sharing a session with friends
-- (later) Node ≥ 22, bun
+- Node ≥ 22, bun
 
 ## Dev
 
@@ -35,7 +38,7 @@ web/             # Astro 6 app
 cp .env.example .env
 just check        # cargo check across the workspace
 just run          # run just the API
-just dev          # api + web in parallel (web lands in P3)
+just dev          # api + web in parallel
 ```
 
 ## Going live

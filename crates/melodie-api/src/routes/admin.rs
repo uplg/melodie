@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::AdminUser;
-use crate::routes::songs::DAILY_CAP;
+use crate::routes::songs::{DAILY_CAP, SongView};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -91,7 +91,7 @@ async fn create_invite(
     ))
 }
 
-/// Admin feed: every user's songs, newest first. Reuses the regular SongView
+/// Admin feed: every user's songs, newest first. Wraps the regular SongView
 /// shape with one extra field (`owner`) so the React island can lean on the
 /// existing `<SongCard>` component.
 #[derive(Debug, Serialize)]
@@ -102,28 +102,9 @@ struct AdminSongOwner {
 
 #[derive(Debug, Serialize)]
 struct AdminSongView {
-    id: String,
     owner: AdminSongOwner,
-    title: Option<String>,
-    tags: Option<String>,
-    lyrics: Option<String>,
-    prompt: Option<String>,
-    language: String,
-    model: String,
-    status: String,
-    error: Option<String>,
-    created_at: String,
-    updated_at: String,
-    clips: Vec<AdminClipView>,
-}
-
-#[derive(Debug, Serialize)]
-struct AdminClipView {
-    id: String,
-    variant_index: i32,
-    status: String,
-    duration_s: Option<f64>,
-    image_url: Option<String>,
+    #[serde(flatten)]
+    song: SongView,
 }
 
 const ADMIN_FEED_LIMIT: u32 = 100;
@@ -136,37 +117,11 @@ async fn list_all_songs(
     let out: Vec<AdminSongView> = rows
         .into_iter()
         .map(|(song, owner_display_name)| AdminSongView {
-            id: song.id.to_string(),
             owner: AdminSongOwner {
                 id: song.owner_id.to_string(),
                 display_name: owner_display_name,
             },
-            title: song.title,
-            tags: song.tags,
-            lyrics: song.lyrics,
-            prompt: song.prompt,
-            language: song.language,
-            model: song.model,
-            status: match song.status {
-                melodie_core::model::SongStatus::Pending => "pending".into(),
-                melodie_core::model::SongStatus::Generating => "generating".into(),
-                melodie_core::model::SongStatus::Complete => "complete".into(),
-                melodie_core::model::SongStatus::Failed => "failed".into(),
-            },
-            error: song.error,
-            created_at: song.created_at.to_rfc3339(),
-            updated_at: song.updated_at.to_rfc3339(),
-            clips: song
-                .clips
-                .into_iter()
-                .map(|c| AdminClipView {
-                    id: c.id,
-                    variant_index: c.variant_index,
-                    status: c.status,
-                    duration_s: c.duration_s,
-                    image_url: c.image_url,
-                })
-                .collect(),
+            song: SongView::from(&song),
         })
         .collect();
     Ok(Json(out))

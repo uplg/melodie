@@ -17,26 +17,25 @@ melodie-engine = { path = "../melodie-engine" }
 
 axum.workspace = true
 tokio.workspace = true
-tower.workspace = true
 tower-http.workspace = true
 tower-sessions.workspace = true
-tower-sessions-sqlx-store.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-figment.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 argon2.workspace = true
+# argon2's password-hash 0.5 re-exports rand_core 0.6's OsRng (used in
+# routes/auth.rs) but doesn't enable its "getrandom" feature itself — without
+# this, OsRng doesn't exist to import.
+rand_core = { version = "0.6", features = ["getrandom"] }
 rand.workspace = true
 base64.workspace = true
 time.workspace = true
 anyhow = "1"
 reqwest.workspace = true
 async-stream = "0.3"
-tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
-futures-util.workspace = true
 mp3lame-encoder = "0.2.4"

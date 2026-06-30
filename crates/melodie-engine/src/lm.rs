@@ -818,10 +818,10 @@ impl HeartMuLaLm {
                 eprintln!("[dbg] last_h n={} maxabs={maxabs:.3e} minabs={minabs:.3e} nonfinite={bad} denorm={denorm}", v.len());
             }
             nf += 1;
-            if nf.is_multiple_of(8) {
-                if let Some(cb) = on_frame.as_deref_mut() {
-                    cb(nf, max_frames);
-                }
+            if nf.is_multiple_of(8)
+                && let Some(cb) = on_frame.as_deref_mut()
+            {
+                cb(nf, max_frames);
             }
         }
         if prof && nf > 0 {

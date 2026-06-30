@@ -8,12 +8,12 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use melodie_core::authz::{self, Action, Resource};
+use melodie_core::authz::Action;
 use melodie_db::club::{ProposalRow, ProposeOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
-use crate::extract::{AdminUser, AuthUser};
+use crate::extract::{AdminUser, AuthUser, require_song_access};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -61,17 +61,7 @@ async fn propose(
     let (clip, owner_id) = melodie_db::clips::find_with_song_owner(&state.db, &clip_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !authz::can(
-        user.role,
-        user.id,
-        Action::Read,
-        Resource::Song {
-            owner_id,
-            song_id: clip.song_id,
-        },
-    ) {
-        return Err(ApiError::Forbidden);
-    }
+    require_song_access(&user, owner_id, clip.song_id, Action::Read)?;
 
     let outcome =
         melodie_db::club::propose(&state.db, &clip_id, user.id, note.as_deref()).await?;
