@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use tokenizers::Tokenizer;
 
 use crate::codec::{CodecWeights, HeartCodec};
@@ -122,11 +122,7 @@ impl Engine {
     /// Generate a song from `lyrics` and style `tags`. Blocking and single-threaded.
     pub fn generate(&self, lyrics: &str, tags: &str, opts: &GenOptions) -> Result<Audio> {
         let p = preprocess(&self.tok, &self.gcfg, tags, lyrics, &self.dev)?;
-        // Stop-gap cap to a known-safe single-segment length (≈16 s): `detokenize_segment`
-        // decodes the whole clip in one Metal pass and a long one spikes memory → OOM →
-        // corrupted/noisy output (the user's 32 GB spikes). Lifted once the memory-bounded
-        // multi-segment path (decode + free per 29.76 s segment) is reworked correctly.
-        let max_frames = opts.max_frames.min(200);
+        let max_frames = opts.max_frames;
         let codes = self.lm.generate_codes(
             &p.tokens,
             &p.mask,
@@ -142,13 +138,19 @@ impl Engine {
         if t == 0 {
             return Err(EngineError::Config("model emitted EOS immediately (no audio)".into()));
         }
-        // EXACT gen_song path: single-segment detokenize on the actual codes with a fresh
-        // randn flow-matching latent. The multi-segment overlap-add path is being reworked
-        // (its seam/in-context handling produced noise); this keeps generation correct.
-        let noise = Tensor::randn(0f32, 1f32, (1, 2 * t, 256), &self.dev)?;
-        let wav = self.codec.detokenize_segment(
+        // Release the LM's generation residency (per-frame intermediates + dropped KV cache)
+        // before the codec runs. Otherwise the whole song's LM pool stays live on the GPU
+        // through the first segment's decode, and on a memory-tight Metal device the decode's
+        // working set tips it over the budget → OOM. The codec then starts from just the two
+        // resident model weights.
+        self.dev.synchronize()?;
+        // Multi-segment overlap-add → full-length songs. The per-channel split + per-stage
+        // synchronize in the decoder keep each segment's GPU residency bounded. `None` ⇒ each
+        // segment draws its flow-matching latent with randn internally.
+        let wav = self.codec.detokenize(
             &codes.unsqueeze(0)?,
-            &noise,
+            None,
+            self.codec_cfg.segment_duration,
             self.codec_cfg.flow_num_steps,
             self.codec_cfg.flow_guidance_scale,
         )?; // [2, N] f32 @ 48 kHz

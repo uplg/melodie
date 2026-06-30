@@ -268,8 +268,27 @@ impl ScalarDecoder {
     }
 
     /// Decode a latent `(N, L, 128)` (MLX-layout, as dumped) → waveform `(N, L*1920)`.
+    /// Decode `(N, L, C)` → `(N, L*1920)`. Each batch item (e.g. the two stereo channels)
+    /// is decoded independently and synchronized, so the ×1920 conv working set is bounded
+    /// to ONE item — roughly halving the decode's peak GPU residency vs the batched form,
+    /// which keeps long songs inside this Mac's memory budget. The conv stack is
+    /// batch-independent, so this is bit-identical to decoding the full batch at once.
     pub fn decode(&self, latent_nlc: &Tensor) -> Result<Tensor> {
-        // (N, L, C) → (N, C, L) and scalar-quantise
+        let n = latent_nlc.dim(0)?;
+        if n <= 1 {
+            return self.decode_one(latent_nlc);
+        }
+        let mut outs = Vec::with_capacity(n);
+        for i in 0..n {
+            outs.push(self.decode_one(&latent_nlc.narrow(0, i, 1)?)?);
+            latent_nlc.device().synchronize()?;
+        }
+        Ok(Tensor::cat(&outs, 0)?)
+    }
+
+    /// Decode a single-item batch `(1, L, C)` through the full conv stack.
+    fn decode_one(&self, latent_nlc: &Tensor) -> Result<Tensor> {
+        // (1, L, C) → (1, C, L) and scalar-quantise
         let x = latent_nlc.transpose(1, 2)?.contiguous()?;
         let x = round9(&x)?;
         let mut x = conv1d(&x, &self.conv0_w, &self.conv0_b, false, 1, 1)?;
@@ -286,7 +305,7 @@ impl ScalarDecoder {
         x = self.post.forward(&x)?;
         x = conv1d(&x, &self.conv7_w, &self.conv7_b, true, 1, 1)?;
         x.device().synchronize()?;
-        // (N, 1, L) → (N, L)
+        // (1, 1, L) → (1, L)
         Ok(x.squeeze(1)?)
     }
 
@@ -397,9 +416,27 @@ impl HeartCodec {
         }
         let total = codes.dim(2)?;
 
-        // --- segment loop (modeling_heartcodec.py:126-165) ---
-        // for sinx in range(0, total - hop_samples + 1, hop_samples)
-        let mut latent_list: Vec<Tensor> = Vec::new();
+        // --- audio overlap-add constants (used inside the segment loop) ---
+        let min_samples_audio = (duration * sample_rate as f64) as usize; // 1428480
+        let hop_samples_audio = min_samples_audio / 93 * 80; //              1228800
+        let ovlp_samples_audio = min_samples_audio - hop_samples_audio; //    199680
+        let win = if ovlp_samples_audio > 0 {
+            Some(linspace01_row(ovlp_samples_audio, dev)?) // (1, ovlp)
+        } else {
+            None
+        };
+
+        // --- interleaved segment loop (modeling_heartcodec.py:126-223) ---
+        // CRITICAL ordering: decode each segment IMMEDIATELY after its flow-matching pass,
+        // then synchronize() to free the GPU, before moving to the next segment. The
+        // reference (and the first port) ran ALL FM passes first and ALL decodes second; on
+        // Metal that leaves every segment's FM residency live when the first decode runs, so
+        // the decode's ×1920 working set tips over the GPU budget → OOM (localised to
+        // `decode segment 0`). Interleaving keeps each segment's peak identical to a verified
+        // single-segment decode, so songs of any length stay bounded. Only the previous
+        // segment's latent is needed (for the in-context prefix), so we carry just that.
+        let mut prev_latent: Option<Tensor> = None;
+        let mut output: Option<Tensor> = None;
         let mut sinx = 0usize;
         while sinx + hop_samples <= total {
             let codes_input = codes.narrow(2, sinx, min_samples)?; // (1,Q,min_samples)
@@ -418,9 +455,9 @@ impl HeartCodec {
                 };
                 self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
             } else {
-                // Subsequent segment: last `ovlp_frames` latents of the previous
-                // segment become the in-context prefix, padded with randn to length.
-                let prev = latent_list.last().unwrap();
+                // Subsequent segment: last `ovlp_frames` latents of the previous segment
+                // become the in-context prefix, padded with randn to length.
+                let prev = prev_latent.as_ref().unwrap();
                 let prev_t = prev.dim(1)?;
                 let true_tail = prev.narrow(1, prev_t - ovlp_frames, ovlp_frames)?; // (1,104,256)
                 let len_add = latent_length - ovlp_frames; // 640
@@ -434,26 +471,10 @@ impl HeartCodec {
                 };
                 self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
             };
-            latent_list.push(latents);
-            sinx += hop_samples;
-        }
-        // first_latent_length == 0 ⇒ no prefix to strip from latent_list[0].
 
-        // --- audio overlap-add (modeling_heartcodec.py:167-223) ---
-        let min_samples_audio = (duration * sample_rate as f64) as usize; // 1428480
-        let hop_samples_audio = min_samples_audio / 93 * 80; //              1228800
-        let ovlp_samples_audio = min_samples_audio - hop_samples_audio; //    199680
-        let win = if ovlp_samples_audio > 0 {
-            Some(linspace01_row(ovlp_samples_audio, dev)?) // (1, ovlp)
-        } else {
-            None
-        };
-
-        let mut output: Option<Tensor> = None;
-        for latent in &latent_list {
-            // (B,T,256) → (B,T,2,128) → (B,2,T,128) → (2B,T,128)
-            let (b, t_lat, f_lat) = latent.dims3()?;
-            let latent_r = latent
+            // Decode this segment NOW (interleaved). (B,T,256) → (B,T,2,128) → (2B,T,128).
+            let (b, t_lat, f_lat) = latents.dims3()?;
+            let latent_r = latents
                 .reshape((b, t_lat, 2, f_lat / 2))?
                 .permute((0, 2, 1, 3))?
                 .contiguous()?
@@ -463,6 +484,7 @@ impl HeartCodec {
                 cur = cur.narrow(1, 0, min_samples_audio)?;
             }
 
+            // Overlap-add this segment's audio into the running output.
             output = Some(match output {
                 None => cur, // first segment
                 Some(prev) => {
@@ -485,6 +507,11 @@ impl HeartCodec {
                     }
                 }
             });
+
+            prev_latent = Some(latents); // carry for the next segment's in-context prefix
+            sinx += hop_samples;
+            // Free this segment's FM + decode GPU residency before the next segment.
+            dev.synchronize()?;
         }
 
         let output = output.unwrap();

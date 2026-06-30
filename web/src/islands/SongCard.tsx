@@ -198,59 +198,47 @@ export default function SongCard({
         </p>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {[0, 1].map((idx) => {
-          const clip = song.clips.find((c) => c.variant_index === idx);
-          return (
-            <ClipSlot
-              key={idx}
-              index={idx}
-              clip={clip}
-              title={song.title}
-              features={features}
-              alreadyProposed={clip ? proposedClipIds.has(clip.id) : false}
-              onClubProposed={onClubProposed}
-            />
-          );
-        })}
+      <div className="grid grid-cols-1 gap-3">
+        {song.clips.map((clip) => (
+          <ClipSlot
+            key={clip.id}
+            clip={clip}
+            title={song.title}
+            features={features}
+            alreadyProposed={proposedClipIds.has(clip.id)}
+            onClubProposed={onClubProposed}
+          />
+        ))}
       </div>
     </li>
   );
 }
 
 function ClipSlot({
-  index,
   clip,
   title,
   features,
   alreadyProposed,
   onClubProposed,
 }: {
-  index: number;
-  clip: Clip | undefined;
+  clip: Clip;
   title: string | null;
   features: Features;
   alreadyProposed: boolean;
   onClubProposed: (clipId: string) => void;
 }) {
-  if (!clip) {
-    return (
-      <div className="rounded-md border border-dashed border-neutral-300 dark:border-neutral-700 p-3 text-xs text-neutral-500">
-        Variant {index + 1} pending…
-      </div>
-    );
-  }
-
-  const playable = clip.status === 'streaming' || clip.status === 'complete';
+  // Audio is served only once the clip is fully rendered (the engine writes the mp3 at the
+  // end), so only offer the player on `complete`; `streaming` shows a generating hint and
+  // never hits the audio endpoint (no 404 mid-generation).
+  const playable = clip.status === 'complete';
   const downloadName = `${slugify(title ?? 'melodie')}-${clip.id.slice(0, 8)}.mp3`;
   const audioUrl = `/api/clips/${clip.id}/audio`;
 
   return (
     <div className="rounded-md border border-neutral-200 dark:border-neutral-800 p-3 space-y-2">
-      <div className="flex items-baseline justify-between text-xs">
-        <span className="font-medium">Variant {index + 1}</span>
+      <div className="flex items-baseline justify-end text-xs">
         <span className="text-neutral-500">
-          {clip.status}
+          {clip.status === 'streaming' ? 'generating…' : clip.status}
           {clip.duration_s ? ` · ${clip.duration_s.toFixed(1)}s` : ''}
         </span>
       </div>

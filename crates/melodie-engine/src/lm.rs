@@ -807,6 +807,13 @@ impl HeartMuLaLm {
                 eprintln!("[dbg] last_h n={} maxabs={maxabs:.3e} minabs={minabs:.3e} nonfinite={bad} denorm={denorm}", v.len());
             }
             nf += 1;
+            // Drain candle's Metal buffer pool periodically. The causal mask `(1, pos+1)` and
+            // the attention's k^T copy both grow with `pos`, so every frame allocates a unique
+            // size → nothing is reused and the pool would balloon to the sum over the whole
+            // song (~GBs), OOM-ing Metal mid-generation and starving the codec that follows.
+            if nf.is_multiple_of(32) {
+                dev.synchronize()?;
+            }
         }
         if prof && nf > 0 {
             println!(
