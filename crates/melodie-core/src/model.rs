@@ -20,13 +20,6 @@ pub struct User {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SongMode {
-    Custom,
-    Describe,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum SongStatus {
     Pending,
     Generating,
@@ -38,12 +31,11 @@ pub enum SongStatus {
 pub struct Song {
     pub id: SongId,
     pub owner_id: UserId,
-    pub mode: SongMode,
     pub title: Option<String>,
     pub tags: Option<String>,
-    pub exclude_tags: Option<String>,
     pub lyrics: Option<String>,
     pub prompt: Option<String>,
+    pub language: String,
     pub model: String,
     pub status: SongStatus,
     pub error: Option<String>,

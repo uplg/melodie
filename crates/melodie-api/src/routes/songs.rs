@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use melodie_core::authz::{self, Action, Resource};
 use melodie_core::ids::SongId;
-use melodie_core::model::{Song, SongMode, SongStatus};
+use melodie_core::model::{Song, SongStatus};
 use melodie_db::clips::UpsertClip;
 use melodie_db::songs::NewSong;
 use serde::{Deserialize, Serialize};
@@ -22,10 +22,6 @@ use crate::error::{ApiError, ApiResult};
 use crate::events::SongEvent;
 use crate::extract::AuthUser;
 use crate::state::AppState;
-
-/// Model identifier recorded on every song row. The local HeartMuLa engine is
-/// the only generator now, so this is a constant.
-const ENGINE_MODEL: &str = "heartmula";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -45,53 +41,30 @@ pub const DAILY_CAP: u32 = 4;
 
 const TITLE_MAX: usize = 100;
 const TAGS_MAX: usize = 1000;
-const EXCLUDE_MAX: usize = 1000;
 const LYRICS_MAX: usize = 5000;
-const PROMPT_MAX: usize = 500;
 
 // --- request / response views ---
 
-/// Body shape for `POST /api/songs`. Tagged-union by `mode`:
-/// - `{ "mode": "custom",   ... }` — full lyrics + tags + sliders.
-/// - `{ "mode": "describe", ... }` — single free-text prompt used as lyrics.
+/// Body shape for `POST /api/songs`. The local HeartMuLa engine's only
+/// generation inputs are `lyrics`, `styles` (short comma-separated genre/mood
+/// tags the user calls "tags") and `language`; `model` records the generator
+/// on the row.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum CreateSongRequest {
-    Custom(CustomFields),
-    Describe(DescribeFields),
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CustomFields {
-    pub title: String,
-    pub tags: String,
-    #[serde(default)]
-    pub exclude_tags: Option<String>,
+pub struct CreateSongRequest {
     pub lyrics: String,
-    #[serde(default)]
-    pub vocal: Option<String>,
-    #[serde(default)]
-    pub weirdness: Option<i32>,
-    #[serde(default)]
-    pub style_influence: Option<i32>,
-    #[serde(default)]
-    pub variation: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DescribeFields {
-    pub prompt: String,
+    pub styles: String,
+    pub language: String,
+    pub model: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SongView {
     pub id: String,
-    pub mode: String,
     pub title: Option<String>,
     pub tags: Option<String>,
-    pub exclude_tags: Option<String>,
     pub lyrics: Option<String>,
     pub prompt: Option<String>,
+    pub language: String,
     pub model: String,
     pub status: String,
     pub error: Option<String>,
@@ -113,15 +86,11 @@ impl From<&Song> for SongView {
     fn from(s: &Song) -> Self {
         Self {
             id: s.id.to_string(),
-            mode: match s.mode {
-                SongMode::Custom => "custom".into(),
-                SongMode::Describe => "describe".into(),
-            },
             title: s.title.clone(),
             tags: s.tags.clone(),
-            exclude_tags: s.exclude_tags.clone(),
             lyrics: s.lyrics.clone(),
             prompt: s.prompt.clone(),
+            language: s.language.clone(),
             model: s.model.clone(),
             status: match s.status {
                 SongStatus::Pending => "pending".into(),
@@ -164,52 +133,41 @@ async fn create(
         }
     }
 
-    // Create the song row (`songs::create` inserts it with `status =
-    // 'generating'`) and pull out the lyrics/tags the engine should sing.
-    let (song_id, lyrics, tags) = match &req {
-        CreateSongRequest::Custom(c) => {
-            let song_id = melodie_db::songs::create(
-                &state.db,
-                NewSong {
-                    owner_id: user.id,
-                    mode: SongMode::Custom,
-                    title: Some(&c.title),
-                    tags: Some(&c.tags),
-                    exclude_tags: c.exclude_tags.as_deref(),
-                    lyrics: Some(&c.lyrics),
-                    prompt: None,
-                    vocal: c.vocal.as_deref(),
-                    weirdness: c.weirdness,
-                    style_inf: c.style_influence,
-                    variation: c.variation.as_deref(),
-                    model: ENGINE_MODEL,
-                },
-            )
-            .await?;
-            (song_id, c.lyrics.trim().to_string(), c.tags.trim().to_string())
-        }
-        CreateSongRequest::Describe(d) => {
-            let song_id = melodie_db::songs::create(
-                &state.db,
-                NewSong {
-                    owner_id: user.id,
-                    mode: SongMode::Describe,
-                    title: None,
-                    tags: None,
-                    exclude_tags: None,
-                    lyrics: None,
-                    prompt: Some(&d.prompt),
-                    vocal: None,
-                    weirdness: None,
-                    style_inf: None,
-                    variation: None,
-                    model: ENGINE_MODEL,
-                },
-            )
-            .await?;
-            (song_id, d.prompt.trim().to_string(), String::new())
-        }
+    // Build the engine tags exactly like the HeartMuLa reference
+    // (`server.py:297-298`): a lowercase, comma-joined, space-free list with the
+    // language first — `"<language>,<style1>,<style2>,…"`. The raw `styles`
+    // string is what we persist as the song's `tags`.
+    let language = req.language.trim().to_lowercase();
+    let normalized_styles = req
+        .styles
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(",");
+    let tags = if language.is_empty() {
+        normalized_styles
+    } else {
+        format!("{language},{normalized_styles}")
     };
+
+    // Create the song row (`songs::create` inserts it with `status =
+    // 'generating'`). Persist the raw styles as the song's tags plus the
+    // chosen language; `lyrics` is handed to the engine unchanged.
+    let song_id = melodie_db::songs::create(
+        &state.db,
+        NewSong {
+            owner_id: user.id,
+            title: None,
+            tags: Some(&req.styles),
+            lyrics: Some(&req.lyrics),
+            language: &language,
+            model: req.model.trim(),
+        },
+    )
+    .await?;
+    let lyrics = req.lyrics.clone();
 
     // One streaming clip up front so the UI has a row to follow; the worker
     // flips it to complete/error when the generation finishes.
@@ -427,71 +385,25 @@ fn parse_song_id(s: &str) -> ApiResult<SongId> {
 }
 
 fn validate_create(req: &CreateSongRequest) -> ApiResult<()> {
-    match req {
-        CreateSongRequest::Custom(c) => validate_custom(c),
-        CreateSongRequest::Describe(d) => validate_describe(d),
-    }
-}
-
-fn validate_custom(c: &CustomFields) -> ApiResult<()> {
-    let title = c.title.trim();
-    if title.is_empty() || title.len() > TITLE_MAX {
+    let styles = req.styles.trim();
+    if styles.is_empty() || styles.len() > TAGS_MAX {
         return Err(ApiError::BadRequest(format!(
-            "title must be 1-{TITLE_MAX} characters"
+            "styles must be 1-{TAGS_MAX} characters"
         )));
     }
-    let tags = c.tags.trim();
-    if tags.is_empty() || tags.len() > TAGS_MAX {
-        return Err(ApiError::BadRequest(format!(
-            "tags must be 1-{TAGS_MAX} characters"
-        )));
-    }
-    if let Some(excl) = c.exclude_tags.as_deref()
-        && excl.len() > EXCLUDE_MAX
-    {
-        return Err(ApiError::BadRequest(format!(
-            "exclude_tags must be at most {EXCLUDE_MAX} characters"
-        )));
-    }
-    let lyrics = c.lyrics.trim();
+    let lyrics = req.lyrics.trim();
     if lyrics.is_empty() || lyrics.len() > LYRICS_MAX {
         return Err(ApiError::BadRequest(format!(
             "lyrics must be 1-{LYRICS_MAX} characters"
         )));
     }
-    if let Some(v) = c.weirdness
-        && !(0..=100).contains(&v)
-    {
-        return Err(ApiError::BadRequest("weirdness must be 0-100".into()));
-    }
-    if let Some(v) = c.style_influence
-        && !(0..=100).contains(&v)
-    {
-        return Err(ApiError::BadRequest(
-            "style_influence must be 0-100".into(),
-        ));
-    }
-    if let Some(v) = c.vocal.as_deref()
-        && !matches!(v, "male" | "female")
-    {
-        return Err(ApiError::BadRequest("vocal must be 'male' or 'female'".into()));
-    }
-    if let Some(v) = c.variation.as_deref()
-        && !matches!(v, "high" | "normal" | "subtle")
-    {
-        return Err(ApiError::BadRequest(
-            "variation must be 'high', 'normal' or 'subtle'".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_describe(d: &DescribeFields) -> ApiResult<()> {
-    let prompt = d.prompt.trim();
-    if prompt.is_empty() || prompt.len() > PROMPT_MAX {
+    if req.language.len() > TITLE_MAX {
         return Err(ApiError::BadRequest(format!(
-            "prompt must be 1-{PROMPT_MAX} characters"
+            "language must be at most {TITLE_MAX} characters"
         )));
+    }
+    if req.model.trim().is_empty() {
+        return Err(ApiError::BadRequest("model is required".into()));
     }
     Ok(())
 }

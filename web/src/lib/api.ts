@@ -36,12 +36,12 @@ export interface Clip {
 
 export interface Song {
   id: string;
-  mode: 'custom' | 'describe';
   title: string | null;
+  /** Comma-separated genres/moods the user typed (the "styles"). */
   tags: string | null;
-  exclude_tags: string | null;
   lyrics: string | null;
   prompt: string | null;
+  language: string;
   model: string;
   status: SongStatus;
   error: string | null;

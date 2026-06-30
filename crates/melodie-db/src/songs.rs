@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use melodie_core::ids::{SongId, UserId};
-use melodie_core::model::{Clip, Song, SongMode, SongStatus};
+use melodie_core::model::{Clip, Song, SongStatus};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -10,12 +10,11 @@ use crate::DbError;
 struct SongRow {
     id: String,
     owner_id: String,
-    mode: String,
     title: Option<String>,
     tags: Option<String>,
-    exclude_tags: Option<String>,
     lyrics: Option<String>,
     prompt: Option<String>,
+    language: String,
     model: String,
     status: String,
     error: Option<String>,
@@ -27,20 +26,15 @@ impl SongRow {
     fn into_domain(self, clips: Vec<Clip>) -> Result<Song, DbError> {
         let id = SongId(parse_uuid(&self.id)?);
         let owner_id = UserId(parse_uuid(&self.owner_id)?);
-        let mode = match self.mode.as_str() {
-            "describe" => SongMode::Describe,
-            _ => SongMode::Custom,
-        };
         let status = parse_song_status(&self.status);
         Ok(Song {
             id,
             owner_id,
-            mode,
             title: self.title,
             tags: self.tags,
-            exclude_tags: self.exclude_tags,
             lyrics: self.lyrics,
             prompt: self.prompt,
+            language: self.language,
             model: self.model,
             status,
             error: self.error,
@@ -82,41 +76,25 @@ pub fn song_status_str(s: SongStatus) -> &'static str {
 
 pub struct NewSong<'a> {
     pub owner_id: UserId,
-    pub mode: SongMode,
     pub title: Option<&'a str>,
     pub tags: Option<&'a str>,
-    pub exclude_tags: Option<&'a str>,
     pub lyrics: Option<&'a str>,
-    pub prompt: Option<&'a str>,
-    pub vocal: Option<&'a str>,
-    pub weirdness: Option<i32>,
-    pub style_inf: Option<i32>,
-    pub variation: Option<&'a str>,
+    pub language: &'a str,
     pub model: &'a str,
 }
 
 pub async fn create(pool: &SqlitePool, new: NewSong<'_>) -> Result<SongId, DbError> {
     let id = SongId::new();
-    let mode_str = match new.mode {
-        SongMode::Custom => "custom",
-        SongMode::Describe => "describe",
-    };
     sqlx::query(
-        "INSERT INTO songs (id, owner_id, mode, title, tags, exclude_tags, lyrics, prompt, vocal, weirdness, style_inf, variation, model, status) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')",
+        "INSERT INTO songs (id, owner_id, title, tags, lyrics, language, model, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'generating')",
     )
     .bind(id.to_string())
     .bind(new.owner_id.to_string())
-    .bind(mode_str)
     .bind(new.title)
     .bind(new.tags)
-    .bind(new.exclude_tags)
     .bind(new.lyrics)
-    .bind(new.prompt)
-    .bind(new.vocal)
-    .bind(new.weirdness)
-    .bind(new.style_inf)
-    .bind(new.variation)
+    .bind(new.language)
     .bind(new.model)
     .execute(pool)
     .await?;
@@ -149,8 +127,8 @@ pub async fn set_status(
 }
 
 /// Set the title only when the row currently has none. Useful for lifting an
-/// engine-derived title into describe-mode rows that started with
-/// `title = NULL`. Idempotent and cheap. Returns rows affected.
+/// engine-derived title into rows that were created with `title = NULL`.
+/// Idempotent and cheap. Returns rows affected.
 pub async fn set_title_if_missing(
     pool: &SqlitePool,
     song_id: SongId,
@@ -188,7 +166,7 @@ pub async fn find_with_clips(
     song_id: SongId,
 ) -> Result<Option<Song>, DbError> {
     let row: Option<SongRow> = sqlx::query_as(
-        "SELECT id, owner_id, mode, title, tags, exclude_tags, lyrics, prompt, model, status, error, created_at, updated_at FROM songs WHERE id = ?",
+        "SELECT id, owner_id, title, tags, lyrics, prompt, language, model, status, error, created_at, updated_at FROM songs WHERE id = ?",
     )
     .bind(song_id.to_string())
     .fetch_optional(pool)
@@ -204,7 +182,7 @@ pub async fn list_by_owner(
     limit: u32,
 ) -> Result<Vec<Song>, DbError> {
     let rows: Vec<SongRow> = sqlx::query_as(
-        "SELECT id, owner_id, mode, title, tags, exclude_tags, lyrics, prompt, model, status, error, created_at, updated_at FROM songs WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT id, owner_id, title, tags, lyrics, prompt, language, model, status, error, created_at, updated_at FROM songs WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
     )
     .bind(owner_id.to_string())
     .bind(limit as i64)
@@ -281,12 +259,11 @@ pub async fn list_in_flight(
 struct SongWithOwnerRow {
     id: String,
     owner_id: String,
-    mode: String,
     title: Option<String>,
     tags: Option<String>,
-    exclude_tags: Option<String>,
     lyrics: Option<String>,
     prompt: Option<String>,
+    language: String,
     model: String,
     status: String,
     error: Option<String>,
@@ -303,8 +280,8 @@ pub async fn list_all_with_owner(
     limit: u32,
 ) -> Result<Vec<(Song, String)>, DbError> {
     let rows: Vec<SongWithOwnerRow> = sqlx::query_as(
-        "SELECT s.id, s.owner_id, s.mode, s.title, s.tags, s.exclude_tags, \
-                s.lyrics, s.prompt, s.model, s.status, s.error, \
+        "SELECT s.id, s.owner_id, s.title, s.tags, \
+                s.lyrics, s.prompt, s.language, s.model, s.status, s.error, \
                 s.created_at, s.updated_at, \
                 u.display_name AS owner_display_name \
          FROM songs s \
@@ -330,12 +307,11 @@ pub async fn list_all_with_owner(
         let song_row = SongRow {
             id: row.id,
             owner_id: row.owner_id,
-            mode: row.mode,
             title: row.title,
             tags: row.tags,
-            exclude_tags: row.exclude_tags,
             lyrics: row.lyrics,
             prompt: row.prompt,
+            language: row.language,
             model: row.model,
             status: row.status,
             error: row.error,
