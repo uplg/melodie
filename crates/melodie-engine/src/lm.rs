@@ -25,6 +25,16 @@ pub struct LmWeights {
 }
 impl LmWeights {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
+        // bf16 on Metal (the reference runtime; matmuls are bandwidth-bound on the weights so
+        // bf16 ≈ 2× f32). f32 on CPU — candle's CPU backend has no bf16 matmul, and CPU is
+        // only used for bit-exact parity tests.
+        let dtype = if matches!(device, Device::Metal(_)) { DType::BF16 } else { DType::F32 };
+        // For bf16-on-Metal: cast f32→bf16 on the CPU and move only the 7.5 GB bf16 to Metal,
+        // freeing each f32 shard before the next. Loading all 15 GB f32 on Metal and casting
+        // there peaks at 22.5 GB (f32 + bf16) which OOMs Metal — and a failed Metal allocation
+        // returns a ZERO buffer rather than erroring, so every weight silently became 0 and the
+        // whole prompt collapsed. CPU cast is reliable; peak stays ≈ 11 GB.
+        let bf16_metal = matches!(device, Device::Metal(_)) && dtype == DType::BF16;
         let mut map = HashMap::new();
         for shard in [
             "model-00001-of-00004.safetensors",
@@ -32,16 +42,20 @@ impl LmWeights {
             "model-00003-of-00004.safetensors",
             "model-00004-of-00004.safetensors",
         ] {
-            map.extend(candle_core::safetensors::load(dir.join(shard), device)?);
+            if bf16_metal {
+                for (k, v) in candle_core::safetensors::load(dir.join(shard), &Device::Cpu)? {
+                    map.insert(k, v.to_dtype(dtype)?.to_device(device)?);
+                }
+            } else {
+                map.extend(candle_core::safetensors::load(dir.join(shard), device)?);
+            }
         }
-        // bf16 on Metal (the reference runtime; matmuls are bandwidth-bound on the
-        // weights so bf16 ≈ 2× f32). f32 on CPU — candle's CPU backend has no bf16
-        // matmul, and CPU is only used for bit-exact parity tests anyway.
-        let dtype = if matches!(device, Device::Metal(_)) { DType::BF16 } else { DType::F32 };
         Ok(Self { map, dtype })
     }
     fn t(&self, key: &str) -> Result<Tensor> {
-        Ok(self.raw(key)?.to_dtype(self.dtype)?)
+        // map is already at `dtype` (cast at load), so this shares the buffer — no extra copy.
+        let r = self.raw(key)?;
+        if r.dtype() == self.dtype { Ok(r) } else { Ok(r.to_dtype(self.dtype)?) }
     }
     /// Head/output weight: always f32 (runs on the f32-upcast transformer output, else
     /// codebooks 1-7 corrupt). On Metal, round to bf16 to match the reference (which

@@ -60,10 +60,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("loading HeartCodec + detokenize...");
-    let w = CodecWeights::load(Path::new(CODEC), &dev)?;
-    let codec = HeartCodec::load(&w, &HeartCodecConfig::default(), &dev)?;
-    let noise = Tensor::randn(0f32, 1f32, (1, 2 * t, 256), &dev)?;
+    // Codec decode on the same device as the LM. MELODIE_CPU_CODEC forces the CPU codec
+    // (verified by the golden tests) for A/B-ing the Metal codec.
+    let cdev = if std::env::var("MELODIE_CPU_CODEC").is_ok() { Device::Cpu } else { dev.clone() };
+    println!("loading HeartCodec + detokenize on {cdev:?}...");
+    let codes = codes.to_device(&cdev)?;
+    let w = CodecWeights::load(Path::new(CODEC), &cdev)?;
+    let codec = HeartCodec::load(&w, &HeartCodecConfig::default(), &cdev)?;
+    let noise = Tensor::randn(0f32, 1f32, (1, 2 * t, 256), &cdev)?;
     let wav = codec.detokenize_segment(&codes.unsqueeze(0)?, &noise, 10, 1.25)?;
     write_wav("gen_song.wav", &wav)?;
     println!("wrote gen_song.wav ({:.2} s) ✅", wav.dim(1)? as f32 / 48000.0);
