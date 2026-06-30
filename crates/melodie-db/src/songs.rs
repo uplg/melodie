@@ -65,15 +65,6 @@ fn parse_song_status(s: &str) -> SongStatus {
     }
 }
 
-pub fn song_status_str(s: SongStatus) -> &'static str {
-    match s {
-        SongStatus::Pending => "pending",
-        SongStatus::Generating => "generating",
-        SongStatus::Complete => "complete",
-        SongStatus::Failed => "failed",
-    }
-}
-
 pub struct NewSong<'a> {
     pub owner_id: UserId,
     pub title: Option<&'a str>,
@@ -118,7 +109,7 @@ pub async fn set_status(
     sqlx::query(
         "UPDATE songs SET status = ?, error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
-    .bind(song_status_str(status))
+    .bind(status.as_str())
     .bind(error)
     .bind(song_id.to_string())
     .execute(pool)
@@ -146,11 +137,7 @@ pub async fn set_title_if_missing(
 }
 
 /// Unconditional title set, used by the manual rename endpoint.
-pub async fn set_title(
-    pool: &SqlitePool,
-    song_id: SongId,
-    title: &str,
-) -> Result<u64, DbError> {
+pub async fn set_title(pool: &SqlitePool, song_id: SongId, title: &str) -> Result<u64, DbError> {
     let r = sqlx::query(
         "UPDATE songs SET title = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
@@ -161,10 +148,7 @@ pub async fn set_title(
     Ok(r.rows_affected())
 }
 
-pub async fn find_with_clips(
-    pool: &SqlitePool,
-    song_id: SongId,
-) -> Result<Option<Song>, DbError> {
+pub async fn find_with_clips(pool: &SqlitePool, song_id: SongId) -> Result<Option<Song>, DbError> {
     let row: Option<SongRow> = sqlx::query_as(
         "SELECT id, owner_id, title, tags, lyrics, prompt, language, model, status, error, created_at, updated_at FROM songs WHERE id = ?",
     )
@@ -216,9 +200,7 @@ pub async fn delete(pool: &SqlitePool, song_id: SongId) -> Result<u64, DbError> 
 /// Returns `(SongId, clip_ids)` so the caller can respawn `poll::spawn`.
 /// Clip-less rows are returned with an empty `clip_ids` so the caller can
 /// mark them failed — they can't be polled and would otherwise stay stuck.
-pub async fn list_in_flight(
-    pool: &SqlitePool,
-) -> Result<Vec<(SongId, Vec<String>)>, DbError> {
+pub async fn list_in_flight(pool: &SqlitePool) -> Result<Vec<(SongId, Vec<String>)>, DbError> {
     #[derive(sqlx::FromRow)]
     struct Row {
         song_id: String,

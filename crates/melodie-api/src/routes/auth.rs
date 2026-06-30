@@ -1,11 +1,14 @@
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Router;
+use melodie_core::ids::UserId;
 use melodie_core::model::{Role, User};
 use melodie_db::{invites, users};
 use serde::{Deserialize, Serialize};
@@ -76,23 +79,51 @@ async fn signup(
     validate_email(&req.email)?;
     validate_password(&req.password)?;
     validate_display_name(&req.display_name)?;
+    // Normalize so "Friend@x.com" and "friend@x.com" are the same account —
+    // the unique index on `lower(email)` is the backstop, this keeps lookups
+    // (login, the pre-create conflict check below) actually finding it.
+    let email = req.email.trim().to_lowercase();
 
-    let invite = invites::find(&state.db, req.invite_code.trim())
+    let password_hash = hash_password(&req.password)?;
+
+    // Claim the invite *before* the user row exists, inside one transaction,
+    // so a lost race (two requests on the same code) can never create a real,
+    // loggable-into account for the loser — `consume` is the sole source of
+    // truth for "is this invite still claimable", checked and acted on
+    // atomically rather than read-then-much-later-written. This briefly
+    // points `invites.used_by` at a user row that doesn't exist yet, which
+    // violates its `REFERENCES users(id)` FK under SQLite's normally-immediate
+    // checking — defer the check to COMMIT, by which point the user row
+    // exists in this same transaction.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut *tx)
+        .await?;
+
+    let invite = invites::find(&mut *tx, req.invite_code.trim())
         .await?
         .ok_or_else(|| ApiError::BadRequest("invalid invite code".into()))?;
     if invite.used_by.is_some() {
         return Err(ApiError::BadRequest("invite already used".into()));
     }
 
-    if users::find_by_email(&state.db, &req.email).await?.is_some() {
+    if users::find_by_email(&state.db, &email).await?.is_some() {
         return Err(ApiError::Conflict("email already registered".into()));
     }
 
-    let password_hash = hash_password(&req.password)?;
-    let user = users::create(
-        &state.db,
+    let user_id = UserId::new();
+    let consumed = invites::consume(&mut *tx, &invite.code, user_id).await?;
+    if !consumed {
+        // Race: someone else consumed it between find() and now. No user row
+        // was ever created for this request, so there's nothing to clean up.
+        return Err(ApiError::Conflict("invite already used".into()));
+    }
+
+    let user = users::create_with_id(
+        &mut *tx,
+        user_id,
         users::NewUser {
-            email: &req.email,
+            email: &email,
             display_name: &req.display_name,
             password_hash: &password_hash,
             role: invite.role(),
@@ -100,14 +131,11 @@ async fn signup(
     )
     .await?;
 
-    let consumed = invites::consume(&state.db, &invite.code, user.id).await?;
-    if !consumed {
-        // Race: someone else consumed it between find() and now. Return 409 so
-        // the client knows to retry with a fresh invite.
-        return Err(ApiError::Conflict("invite already used".into()));
-    }
+    tx.commit().await?;
 
-    session.insert(SESSION_USER_KEY, user.id.to_string()).await?;
+    session
+        .insert(SESSION_USER_KEY, user.id.to_string())
+        .await?;
     Ok((StatusCode::CREATED, Json(UserView::from(&user))))
 }
 
@@ -122,14 +150,17 @@ async fn login(
     session: Session,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<UserView>> {
-    let (user, password_hash) = users::find_by_email(&state.db, &req.email)
+    let email = req.email.trim().to_lowercase();
+    let (user, password_hash) = users::find_by_email(&state.db, &email)
         .await?
         .ok_or(ApiError::Unauthorized)?;
     verify_password(&req.password, &password_hash)?;
     // Cycle the session id on auth state change (defense in depth against
     // session fixation).
     session.cycle_id().await?;
-    session.insert(SESSION_USER_KEY, user.id.to_string()).await?;
+    session
+        .insert(SESSION_USER_KEY, user.id.to_string())
+        .await?;
     Ok(Json(UserView::from(&user)))
 }
 

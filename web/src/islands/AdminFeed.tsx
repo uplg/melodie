@@ -1,92 +1,30 @@
-import { useCallback, useEffect, useState } from 'react';
-import {
-  applySongEvent,
-  deleteSong as deleteSongApi,
-  fetchAdminSongs,
-  fetchMyProposedClips,
-  renameSong as renameSongApi,
-  type AdminSong,
-  type Features,
-  type SongEvent,
-} from '../lib/api';
+import { useSongFeed } from '../lib/useSongFeed';
+import { fetchAdminSongs, type Features } from '../lib/api';
+import ErrorBoundary from './ErrorBoundary';
 import SongCard from './SongCard';
 
 interface Props {
   features: Features;
 }
 
+// Pick up new songs from other users without manual refresh. Per-card SSE
+// handles status changes for songs we already know about; only *new* songs
+// need polling.
+const POLL_INTERVAL_MS = 30_000;
+
 export default function AdminFeed({ features }: Props) {
-  const [songs, setSongs] = useState<AdminSong[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [proposedClipIds, setProposedClipIds] = useState<ReadonlySet<string>>(
-    () => new Set()
-  );
-
-  const handleClubProposed = useCallback((clipId: string) => {
-    setProposedClipIds((prev) => {
-      const next = new Set(prev);
-      next.add(clipId);
-      return next;
-    });
-  }, []);
-
-  const refresh = useCallback(
-    async (showSpinner = false) => {
-      if (showSpinner) setRefreshing(true);
-      try {
-        const rows = await fetchAdminSongs();
-        setSongs(rows);
-        setError(null);
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Failed to load feed');
-      } finally {
-        setLoading(false);
-        if (showSpinner) setRefreshing(false);
-      }
-    },
-    []
-  );
-
-  useEffect(() => {
-    refresh();
-    fetchMyProposedClips()
-      .then((ids) => setProposedClipIds(new Set(ids)))
-      .catch(() => {
-        // Non-critical (see MelodieApp).
-      });
-    // Pick up new songs from other users without manual refresh. Per-card
-    // SSE handles status changes for songs we already know about; only
-    // *new* songs need polling.
-    const id = setInterval(() => refresh(false), 30_000);
-    return () => clearInterval(id);
-  }, [refresh]);
-
-  const handleUpdate = useCallback((ev: SongEvent) => {
-    setSongs((prev) =>
-      prev.map((s) => (s.id === ev.song_id ? applySongEvent(s, ev) : s))
-    );
-  }, []);
-
-  const handleDelete = useCallback(
-    async (id: string) => {
-      const snapshot = songs;
-      setSongs((prev) => prev.filter((s) => s.id !== id));
-      try {
-        await deleteSongApi(id);
-      } catch {
-        setSongs(snapshot);
-        alert('Failed to delete — try again.');
-      }
-    },
-    [songs]
-  );
-
-  const handleRename = useCallback(async (id: string, title: string) => {
-    await renameSongApi(id, title);
-    setSongs((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
-  }, []);
+  const {
+    songs,
+    loading,
+    error,
+    refreshing,
+    refresh,
+    proposedClipIds,
+    handleClubProposed,
+    handleUpdate,
+    handleDelete,
+    handleRename,
+  } = useSongFeed({ fetcher: fetchAdminSongs, pollIntervalMs: POLL_INTERVAL_MS });
 
   return (
     <div className="space-y-4">
@@ -124,17 +62,18 @@ export default function AdminFeed({ features }: Props) {
       ) : (
         <ul className="space-y-3">
           {songs.map((song) => (
-            <SongCard
-              key={song.id}
-              song={song}
-              features={features}
-              proposedClipIds={proposedClipIds}
-              onClubProposed={handleClubProposed}
-              owner={song.owner.display_name}
-              onUpdate={handleUpdate}
-              onDelete={handleDelete}
-              onRename={handleRename}
-            />
+            <ErrorBoundary key={song.id}>
+              <SongCard
+                song={song}
+                features={features}
+                proposedClipIds={proposedClipIds}
+                onClubProposed={handleClubProposed}
+                owner={song.owner.display_name}
+                onUpdate={handleUpdate}
+                onDelete={handleDelete}
+                onRename={handleRename}
+              />
+            </ErrorBoundary>
           ))}
         </ul>
       )}

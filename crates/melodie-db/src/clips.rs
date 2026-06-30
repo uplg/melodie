@@ -107,8 +107,7 @@ pub async fn find_with_song_owner(
     .await?;
     let Some(j) = row else { return Ok(None) };
     let song_id = SongId(
-        Uuid::parse_str(&j.song_id)
-            .map_err(|e| DbError::Sqlx(sqlx::Error::Decode(Box::new(e))))?,
+        Uuid::parse_str(&j.song_id).map_err(|e| DbError::Sqlx(sqlx::Error::Decode(Box::new(e))))?,
     );
     let owner = melodie_core::ids::UserId(
         Uuid::parse_str(&j.owner_id)

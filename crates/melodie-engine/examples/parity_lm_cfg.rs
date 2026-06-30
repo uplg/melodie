@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use candle_core::Device;
+use melodie_engine::Result;
 use melodie_engine::lm::{HeartMuLaLm, LmWeights};
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/lm_cfg.safetensors";
 const LM: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartMuLa-oss-3B";
@@ -38,6 +38,13 @@ fn main() -> Result<()> {
     let gen_i: Vec<i64> = samples.iter().map(|&x| x as i64).collect();
     let samples_ok = gen_i == curr_g;
     println!("  samples rust={gen_i:?} golden={curr_g:?} match={samples_ok}");
-    println!("{}", if worst < 1e-2 && samples_ok { "CFG PARITY OK ✅" } else { "CFG PARITY OFF ❌" });
+    println!(
+        "{}",
+        if worst < 1e-2 && samples_ok {
+            "CFG PARITY OK ✅"
+        } else {
+            "CFG PARITY OFF ❌"
+        }
+    );
     Ok(())
 }

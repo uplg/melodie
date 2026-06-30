@@ -19,8 +19,8 @@ use melodie_core::model::SongStatus;
 use melodie_db::clips::UpsertClip;
 use melodie_engine::{Engine, EngineConfig, GenOptions, GenProgress, GenStage};
 use sqlx::SqlitePool;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{broadcast, watch};
 
 use crate::events::{ClipEventView, SongEvent};
 
@@ -34,7 +34,30 @@ pub struct EngineJob {
 }
 
 /// Submit handle for local generation jobs. Clone-cheap; lives in `AppState`.
-pub type EngineHandle = UnboundedSender<EngineJob>;
+/// The engine can't be interrupted mid-job (the candle/Metal compute loop has
+/// no cancellation hook), so [`EngineHandle::wait_idle`] is how shutdown
+/// avoids killing a generation outright — see `main.rs::shutdown_signal`.
+#[derive(Clone)]
+pub struct EngineHandle {
+    tx: UnboundedSender<EngineJob>,
+    busy: watch::Receiver<bool>,
+}
+
+impl EngineHandle {
+    pub fn send(
+        &self,
+        job: EngineJob,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<EngineJob>> {
+        self.tx.send(job)
+    }
+
+    /// Resolves once the worker thread has no job in flight (immediately if
+    /// it's already idle).
+    pub async fn wait_idle(&self) {
+        let mut busy = self.busy.clone();
+        let _ = busy.wait_for(|b| !*b).await;
+    }
+}
 
 /// Spawn the dedicated engine thread and return a submit handle.
 pub fn spawn_worker(
@@ -45,6 +68,7 @@ pub fn spawn_worker(
     audio_dir: PathBuf,
 ) -> EngineHandle {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineJob>();
+    let (busy_tx, busy_rx) = watch::channel(false);
     std::thread::spawn(move || {
         let engine = match Engine::load(&cfg) {
             Ok(e) => e,
@@ -55,7 +79,11 @@ pub fn spawn_worker(
         };
         tracing::info!("local engine loaded");
         while let Some(job) = rx.blocking_recv() {
-            let opts = GenOptions { max_frames: job.max_frames, ..Default::default() };
+            let _ = busy_tx.send(true);
+            let opts = GenOptions {
+                max_frames: job.max_frames,
+                ..Default::default()
+            };
             let song_id = job.song_id.to_string();
             // RSS at start/end of every request: if it climbs across successive jobs
             // we're accumulating; if it just sits near Mélodie's ~13 GB the swap spikes
@@ -142,9 +170,10 @@ pub fn spawn_worker(
             };
             tracing::info!("engine: song {song_id} done rss={}", rss_gb());
             rt.block_on(finish(&db, &events, job, result));
+            let _ = busy_tx.send(false);
         }
     });
-    tx
+    EngineHandle { tx, busy: busy_rx }
 }
 
 /// Best-effort resident set size of this process, formatted like `"13.4GB"`.
@@ -156,7 +185,10 @@ fn rss_gb() -> String {
         .output()
     {
         Ok(out) => {
-            let kb: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0.0);
+            let kb: f64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
             format!("{:.1}GB", kb / 1024.0 / 1024.0)
         }
         Err(_) => "?".to_string(),
@@ -176,14 +208,22 @@ impl StreamMp3 {
     fn new(path: &Path, channels: u16, sample_rate: u32) -> Result<Self, String> {
         use mp3lame_encoder::{Bitrate, Builder, Quality};
         let mut b = Builder::new().ok_or_else(|| "mp3lame: builder alloc failed".to_string())?;
-        b.set_num_channels(channels as u8).map_err(|e| format!("mp3lame channels: {e}"))?;
-        b.set_sample_rate(sample_rate).map_err(|e| format!("mp3lame sample_rate: {e}"))?;
-        b.set_brate(Bitrate::Kbps192).map_err(|e| format!("mp3lame brate: {e}"))?;
-        b.set_quality(Quality::Good).map_err(|e| format!("mp3lame quality: {e}"))?;
+        b.set_num_channels(channels as u8)
+            .map_err(|e| format!("mp3lame channels: {e}"))?;
+        b.set_sample_rate(sample_rate)
+            .map_err(|e| format!("mp3lame sample_rate: {e}"))?;
+        b.set_brate(Bitrate::Kbps192)
+            .map_err(|e| format!("mp3lame brate: {e}"))?;
+        b.set_quality(Quality::Good)
+            .map_err(|e| format!("mp3lame quality: {e}"))?;
         let encoder = b.build().map_err(|e| format!("mp3lame build: {e}"))?;
         let file =
             std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        Ok(Self { encoder, file, err: None })
+        Ok(Self {
+            encoder,
+            file,
+            err: None,
+        })
     }
     /// Encode + append one interleaved-stereo chunk (`l,r,l,r,…`). Errors are latched.
     fn write(&mut self, pcm: &[f32]) {
@@ -217,7 +257,9 @@ impl StreamMp3 {
         self.encoder
             .flush_to_vec::<FlushNoGap>(&mut mp3)
             .map_err(|e| format!("mp3lame flush: {e}"))?;
-        self.file.write_all(&mp3).map_err(|e| format!("mp3 write: {e}"))?;
+        self.file
+            .write_all(&mp3)
+            .map_err(|e| format!("mp3 write: {e}"))?;
         self.file.flush().map_err(|e| format!("mp3 flush: {e}"))?;
         Ok(())
     }

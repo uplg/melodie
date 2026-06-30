@@ -23,14 +23,17 @@ fn write_wav(path: &str, wav: &Tensor) -> Result<()> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut wtr = hound::WavWriter::create(path, spec).map_err(|e| EngineError::Config(e.to_string()))?;
+    let mut wtr =
+        hound::WavWriter::create(path, spec).map_err(|e| EngineError::Config(e.to_string()))?;
     for i in 0..ch0.len() {
         for &s in &[ch0[i], ch1[i]] {
             let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-            wtr.write_sample(v).map_err(|e| EngineError::Config(e.to_string()))?;
+            wtr.write_sample(v)
+                .map_err(|e| EngineError::Config(e.to_string()))?;
         }
     }
-    wtr.finalize().map_err(|e| EngineError::Config(e.to_string()))?;
+    wtr.finalize()
+        .map_err(|e| EngineError::Config(e.to_string()))?;
     Ok(())
 }
 
@@ -38,7 +41,10 @@ fn main() -> Result<()> {
     let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
     println!("device: {dev:?}");
     let frames = 24usize;
-    let s: usize = std::env::var("MELODIE_PROMPT_LEN").ok().and_then(|x| x.parse().ok()).unwrap_or(8);
+    let s: usize = std::env::var("MELODIE_PROMPT_LEN")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(8);
     let ncb = 8usize;
 
     println!("loading HeartMuLa LM (15 GB)...");
@@ -48,7 +54,15 @@ fn main() -> Result<()> {
         drop(w); // free the 15 GB f32 source; the model keeps only its bf16 copy (~7.5 GB)
         // synthetic text-only prompt of length s (BOS … EOS)
         let text_ids: Vec<i64> = (0..s)
-            .map(|i| if i == 0 { 128000 } else if i == s - 1 { 128001 } else { (100 + i) as i64 })
+            .map(|i| {
+                if i == 0 {
+                    128000
+                } else if i == s - 1 {
+                    128001
+                } else {
+                    (100 + i) as i64
+                }
+            })
             .collect();
         let mut tg = vec![0i64; s * (ncb + 1)];
         let mut mg = vec![0i64; s * (ncb + 1)];
@@ -58,12 +72,29 @@ fn main() -> Result<()> {
         }
         let tokens = Tensor::from_vec(tg, (1, s, ncb + 1), &dev)?;
         let mask = Tensor::from_vec(mg, (1, s, ncb + 1), &dev)?;
-        let cfg: f64 = std::env::var("MELODIE_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let cfg: f64 = std::env::var("MELODIE_CFG")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         println!("generating {frames} frames (multi-frame loop, cfg={cfg})...");
         let t0 = std::time::Instant::now();
-        let c = lm.generate_codes(&tokens, &mask, None, &GenParams { cfg_scale: cfg, max_frames: frames, topk: 50, temperature: 1.0 }, None)?;
+        let c = lm.generate_codes(
+            &tokens,
+            &mask,
+            None,
+            &GenParams {
+                cfg_scale: cfg,
+                max_frames: frames,
+                topk: 50,
+                temperature: 1.0,
+            },
+            None,
+        )?;
         let el = t0.elapsed().as_secs_f32();
-        println!("  generation: {el:.1} s ({:.0} ms/frame)", el * 1000.0 / frames as f32);
+        println!(
+            "  generation: {el:.1} s ({:.0} ms/frame)",
+            el * 1000.0 / frames as f32
+        );
         c
     }; // LM dropped here, freeing ~15 GB before loading the codec
 
@@ -76,7 +107,11 @@ fn main() -> Result<()> {
     let noise = Tensor::randn(0f32, 1f32, (1, 2 * t, 256), &dev)?;
     println!("detokenize...");
     let wav = codec.detokenize_segment(&codes.unsqueeze(0)?, &noise, 10, 1.25)?;
-    println!("waveform {:?}  ({:.2} s)", wav.dims(), wav.dim(1)? as f32 / 48000.0);
+    println!(
+        "waveform {:?}  ({:.2} s)",
+        wav.dims(),
+        wav.dim(1)? as f32 / 48000.0
+    );
 
     write_wav("gen_demo.wav", &wav)?;
     println!("wrote gen_demo.wav ✅");

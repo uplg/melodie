@@ -57,12 +57,12 @@ pub struct HeartMuLaConfig {
     pub audio_num_codebooks: usize, // 8
     pub muq_dim: usize,             // 512 (style/reference embedding)
     // Llama-3.1 scaled RoPE
-    pub rope_base: f64,             // 500000
-    pub rope_scale_factor: f64,     // 32
-    pub rope_low_freq_factor: f64,  // 1
-    pub rope_high_freq_factor: f64, // 4
+    pub rope_base: f64,              // 500000
+    pub rope_scale_factor: f64,      // 32
+    pub rope_low_freq_factor: f64,   // 1
+    pub rope_high_freq_factor: f64,  // 4
     pub rope_old_context_len: usize, // 8192
-    pub norm_eps: f64,              // 1e-5 (RMSNorm)
+    pub norm_eps: f64,               // 1e-5 (RMSNorm)
 }
 
 impl Default for HeartMuLaConfig {
@@ -110,19 +110,19 @@ pub struct DitConfig {
 /// HeartCodec config — configuration_heartcodec.py:17-49, modeling_heartcodec.py.
 #[derive(Debug, Clone)]
 pub struct HeartCodecConfig {
-    pub sample_rate: usize,      // 48000
-    pub causal: bool,            // true
+    pub sample_rate: usize,       // 48000
+    pub causal: bool,             // true
     pub latent_hidden_dim: usize, // 128 (per-stream SQ latent)
     /// SQ encoder/decoder up/down ratios; product * num_samples = 1920 (→ 25 Hz).
-    pub ratios: [usize; 5],      // encoder [3,4,4,4,5]; decoder is reversed
-    pub num_samples: usize,      // 2 (Pre/PostProcessor avgpool/repeat)
+    pub ratios: [usize; 5], // encoder [3,4,4,4,5]; decoder is reversed
+    pub num_samples: usize,       // 2 (Pre/PostProcessor avgpool/repeat)
     pub rvq: RvqConfig,
     pub dit: DitConfig,
-    pub flow_num_steps: usize,   // 10 (Euler ODE)
+    pub flow_num_steps: usize,    // 10 (Euler ODE)
     pub flow_guidance_scale: f64, // 1.25 (CFG)
-    pub codes_frame_rate: f64,   // 12.5 Hz (RVQ codes from the LM)
-    pub latent_frame_rate: f64,  // 25 Hz (FM latent)
-    pub segment_duration: f64,   // 29.76 s per decode segment
+    pub codes_frame_rate: f64,    // 12.5 Hz (RVQ codes from the LM)
+    pub latent_frame_rate: f64,   // 25 Hz (FM latent)
+    pub segment_duration: f64,    // 29.76 s per decode segment
 }
 
 impl Default for HeartCodecConfig {
@@ -133,7 +133,12 @@ impl Default for HeartCodecConfig {
             latent_hidden_dim: 128,
             ratios: [3, 4, 4, 4, 5],
             num_samples: 2,
-            rvq: RvqConfig { num_quantizers: 8, codebook_size: 8192, codebook_dim: 32, dim: 512 },
+            rvq: RvqConfig {
+                num_quantizers: 8,
+                codebook_size: 8192,
+                codebook_dim: 32,
+                dim: 512,
+            },
             dit: DitConfig {
                 num_layers_stage1: 24,
                 num_layers_stage2: 6,
@@ -157,37 +162,19 @@ impl Default for HeartCodecConfig {
 /// Special token IDs — `gen_config.json` / HeartMuLaGenConfig (music_generation.py:31-34).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenConfig {
-    pub text_bos_id: u32, // 128000
-    pub text_eos_id: u32, // 128001
+    pub text_bos_id: u32,  // 128000
+    pub text_eos_id: u32,  // 128001
     pub audio_eos_id: u32, // 8193 (codebook-0 token >= this => EOS)
-    pub empty_id: u32,    // 0
+    pub empty_id: u32,     // 0
 }
 
 impl Default for GenConfig {
     fn default() -> Self {
-        Self { text_bos_id: 128000, text_eos_id: 128001, audio_eos_id: 8193, empty_id: 0 }
-    }
-}
-
-/// Sampling / generation parameters — pipeline defaults (music_generation.py:331-346),
-/// server request bounds (server.py:71-74).
-#[derive(Debug, Clone)]
-pub struct SamplingParams {
-    pub cfg_scale: f64,             // 1.5 (>1 => classifier-free guidance, batch doubled)
-    pub temperature: f64,          // 1.0
-    pub topk: usize,               // 50
-    pub max_audio_length_ms: u64,  // 120_000 default; 80 ms per LM frame (12.5 Hz)
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self { cfg_scale: 1.5, temperature: 1.0, topk: 50, max_audio_length_ms: 120_000 }
-    }
-}
-
-impl SamplingParams {
-    /// LM frame cap: max_audio_length_ms / 80 (music_generation.py:212).
-    pub fn max_audio_frames(&self) -> u64 {
-        self.max_audio_length_ms / 80
+        Self {
+            text_bos_id: 128000,
+            text_eos_id: 128001,
+            audio_eos_id: 8193,
+            empty_id: 0,
+        }
     }
 }

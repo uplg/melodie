@@ -52,7 +52,9 @@ async fn audio(
 
 /// Serve a finished file, honouring a `Range:` request with `206 Partial Content` for seeking.
 async fn serve_range(path: &std::path::Path, headers: &HeaderMap) -> ApiResult<Response> {
-    let data = tokio::fs::read(path).await.map_err(|_| ApiError::NotFound)?;
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
     let len = data.len() as u64;
     if let Some((start, end)) = headers
         .get(header::RANGE)
@@ -82,7 +84,11 @@ fn parse_range(raw: &str, len: u64) -> Option<(u64, u64)> {
     }
     let (s, e) = raw.strip_prefix("bytes=")?.split_once('-')?;
     let start: u64 = if s.is_empty() { 0 } else { s.parse().ok()? };
-    let end: u64 = if e.is_empty() { len - 1 } else { e.parse::<u64>().ok()?.min(len - 1) };
+    let end: u64 = if e.is_empty() {
+        len - 1
+    } else {
+        e.parse::<u64>().ok()?.min(len - 1)
+    };
     (start <= end).then_some((start, end))
 }
 
@@ -146,11 +152,12 @@ struct HomiePushReply {
 /// Push a clip's audio to homie's loopback push server, which drops it into the
 /// live music queue (same path as a viewer-typed `!yt <direct-url>`). We hand
 /// homie a URL pointing back at this server's own clip-audio endpoint, built
-/// from the request `Host`. Owner-or-admin gated, same as the audio endpoint.
+/// from `AppConfig::local_base_url` — never the request's `Host` header,
+/// which a client can forge to make homie fetch an arbitrary URL of their
+/// choosing. Owner-or-admin gated, same as the audio endpoint.
 async fn push_to_live(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
-    headers: HeaderMap,
     Path(clip_id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PushToLiveResponse>)> {
     let push = state
@@ -176,38 +183,41 @@ async fn push_to_live(
         .ok_or(ApiError::NotFound)?;
     let title = song.title.clone();
 
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::BadRequest("missing Host header".into()))?;
-    let audio_url = format!("http://{host}/api/clips/{clip_id}/audio");
+    let audio_url = format!("{}/api/clips/{clip_id}/audio", state.local_base_url);
 
     let body = serde_json::json!({
         "url": audio_url,
         "requested_by": user.display_name,
         "title": title,
     });
-    let reply: HomiePushReply = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .post(&push.url)
         .bearer_auth(&push.token)
         .json(&body)
         .send()
         .await
-        .map_err(|err| ApiError::Internal(format!("homie push request failed: {err}")))?
-        .error_for_status()
-        .map_err(|err| {
-            // 401/422 from homie surface as 502 here so the client knows the
-            // upstream rejected it and can show the message.
-            ApiError::Internal(format!("homie push rejected: {err}"))
-        })?
-        .json()
-        .await
-        .map_err(|err| ApiError::Internal(format!("homie push response decode: {err}")))?;
+        .map_err(|err| ApiError::Internal(format!("homie push request failed: {err}")))?;
 
-    if !reply.queued {
-        return Err(ApiError::BadRequest(
-            reply.error.unwrap_or_else(|| "homie rejected the push".into()),
-        ));
+    // Read the body before branching on status — homie's reject reason lives
+    // in the JSON payload (`HomiePushReply.error`) even on a non-2xx, and
+    // discarding it (the old `.error_for_status()` did) left every push
+    // failure with a generic message and no path for the real reason to
+    // reach the client.
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|err| ApiError::Internal(format!("homie push response read: {err}")))?;
+    let reply: HomiePushReply = serde_json::from_str(&text).map_err(|err| {
+        ApiError::Internal(format!(
+            "homie push response decode (status {status}): {err}"
+        ))
+    })?;
+
+    if !status.is_success() || !reply.queued {
+        return Err(ApiError::BadRequest(reply.error.unwrap_or_else(|| {
+            format!("homie rejected the push (status {status})")
+        })));
     }
 
     Ok((

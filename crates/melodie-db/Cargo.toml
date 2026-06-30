@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 melodie-core = { path = "../melodie-core" }
@@ -12,3 +13,6 @@ sqlx.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

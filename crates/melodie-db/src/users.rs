@@ -62,11 +62,12 @@ pub async fn find_by_email(
 }
 
 pub async fn find_by_id(pool: &SqlitePool, id: UserId) -> Result<Option<User>, DbError> {
-    let row: Option<UserRow> =
-        sqlx::query_as("SELECT id, email, display_name, password_hash, role, created_at FROM users WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, display_name, password_hash, role, created_at FROM users WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(UserRow::into_domain).transpose()?.map(|(u, _)| u))
 }
 
@@ -77,8 +78,17 @@ pub struct NewUser<'a> {
     pub role: Role,
 }
 
-pub async fn create(pool: &SqlitePool, new: NewUser<'_>) -> Result<User, DbError> {
-    let id = UserId::new();
+/// Insert a user under a caller-chosen id. Generic over the executor so the
+/// caller can run this inside a transaction (e.g. atomically alongside
+/// claiming the invite that grants the account, see `routes/auth.rs::signup`).
+pub async fn create_with_id<'e, E>(
+    executor: E,
+    id: UserId,
+    new: NewUser<'_>,
+) -> Result<User, DbError>
+where
+    E: sqlx::SqliteExecutor<'e>,
+{
     let role_str = match new.role {
         Role::Admin => "admin",
         Role::Member => "member",
@@ -91,10 +101,14 @@ pub async fn create(pool: &SqlitePool, new: NewUser<'_>) -> Result<User, DbError
     .bind(new.display_name)
     .bind(new.password_hash)
     .bind(role_str)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
-    find_by_id(pool, id)
-        .await?
-        .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+    Ok(User {
+        id,
+        email: new.email.to_string(),
+        display_name: new.display_name.to_string(),
+        role: new.role,
+        created_at: Utc::now(),
+    })
 }

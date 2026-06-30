@@ -5,4 +5,3 @@
 pub mod authz;
 pub mod ids;
 pub mod model;
-pub mod notif;

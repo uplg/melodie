@@ -42,7 +42,13 @@ fn encode(tok: &Tokenizer, s: &str, gcfg: &GenConfig) -> Result<Vec<i64>> {
 
 /// Build the prompt from `tags` (style, e.g. "french chanson, male vocal") and `lyrics`.
 /// Mirrors `HeartMuLaGenPipeline.preprocess` (music_generation.py:66-147).
-pub fn preprocess(tok: &Tokenizer, gcfg: &GenConfig, tags: &str, lyrics: &str, dev: &Device) -> Result<Prompt> {
+pub fn preprocess(
+    tok: &Tokenizer,
+    gcfg: &GenConfig,
+    tags: &str,
+    lyrics: &str,
+    dev: &Device,
+) -> Result<Prompt> {
     let mut tags_s = tags.to_lowercase();
     if !tags_s.starts_with("<tag>") {
         tags_s = format!("<tag>{tags_s}");

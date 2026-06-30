@@ -5,10 +5,10 @@
 use std::path::Path;
 
 use candle_core::Device;
+use melodie_engine::Result;
 use melodie_engine::codec::{CodecWeights, HeartCodec};
 use melodie_engine::config::HeartCodecConfig;
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/codec_seg0.safetensors";
 const CKPT: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss";
@@ -28,7 +28,17 @@ fn main() -> Result<()> {
     let wav = codec.detokenize_segment(&codes, noise, 10, 1.25)?;
     let d = max_abs_diff(&wav, wav_g)?;
     let rms = wav_g.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
-    println!("waveform {:?}  max|Δ|={d:.3e}  (golden rms={rms:.3e})", wav.dims());
-    println!("{}", if d < 1e-3 { "HeartCodec end-to-end PARITY OK ✅" } else { "PARITY OFF ❌" });
+    println!(
+        "waveform {:?}  max|Δ|={d:.3e}  (golden rms={rms:.3e})",
+        wav.dims()
+    );
+    println!(
+        "{}",
+        if d < 1e-3 {
+            "HeartCodec end-to-end PARITY OK ✅"
+        } else {
+            "PARITY OFF ❌"
+        }
+    );
     Ok(())
 }

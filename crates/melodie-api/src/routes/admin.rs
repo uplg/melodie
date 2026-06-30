@@ -22,7 +22,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/invites", get(list_invites).post(create_invite))
         .route("/admin/songs", get(list_all_songs))
         .route("/admin/quotas", get(list_quotas).delete(reset_all_quotas))
-        .route("/admin/quotas/{user_id}", axum::routing::delete(reset_user_quota))
+        .route(
+            "/admin/quotas/{user_id}",
+            axum::routing::delete(reset_user_quota),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -147,7 +150,11 @@ async fn list_quotas(
     let out = rows
         .into_iter()
         .map(|r| QuotaView {
-            cap: if r.role == "admin" { None } else { Some(DAILY_CAP) },
+            cap: if r.role == "admin" {
+                None
+            } else {
+                Some(DAILY_CAP)
+            },
             user_id: r.user_id,
             display_name: r.display_name,
             role: r.role,

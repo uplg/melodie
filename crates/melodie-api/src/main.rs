@@ -23,9 +23,6 @@ async fn main() -> anyhow::Result<()> {
     let pool = melodie_db::connect_and_migrate(&cfg.database_url).await?;
     bootstrap::ensure_bootstrap_invite(&pool, cfg.bootstrap_invite.as_deref()).await?;
 
-    // Single-publisher shutdown signal that fans out to background tasks.
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-
     // Capacity: at low volume (handful of friends, ~10 concurrent generations)
     // 64 is plenty. Lagged subscribers drop frames silently and re-sync on
     // the next tick anyway.
@@ -35,17 +32,24 @@ async fn main() -> anyhow::Result<()> {
     // the worker queue isn't persisted, so bury those rows up front.
     resume::resume_in_flight(pool.clone()).await;
 
-    let app = router::build(&cfg, pool, events_tx).await?;
+    let (app, engine) = router::build(&cfg, pool, events_tx).await?;
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, "melodie-api listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+        .with_graceful_shutdown(shutdown_signal(engine))
         .await?;
     Ok(())
 }
 
-async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
+/// The engine can't be interrupted mid-job, so on SIGTERM/SIGINT we stop
+/// accepting new connections (axum's graceful shutdown handles that once this
+/// future resolves) but don't actually let the process exit until any
+/// in-flight generation finishes — otherwise a restart silently discards
+/// whatever GPU compute was in progress with no record of it ever existing
+/// (the "generating" row only gets buried on the *next* boot, see
+/// `resume::resume_in_flight`). Capped so a stuck engine can't block forever.
+async fn shutdown_signal(engine: engine::EngineHandle) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
@@ -53,5 +57,12 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
         _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
         _ = sigint.recv()  => tracing::info!("SIGINT received, shutting down"),
     }
-    let _ = shutdown_tx.send(());
+
+    tracing::info!("waiting for in-flight generation to finish (up to 5 min)");
+    if tokio::time::timeout(std::time::Duration::from_secs(5 * 60), engine.wait_idle())
+        .await
+        .is_err()
+    {
+        tracing::warn!("generation still running after 5 min, exiting anyway");
+    }
 }

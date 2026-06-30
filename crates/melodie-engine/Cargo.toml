@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 # Local HeartMuLa inference engine (pure-Rust, candle) — Mélodie's music
 # generator. Ported from ../heartlib-mlx (HeartMuLa LM + HeartCodec).

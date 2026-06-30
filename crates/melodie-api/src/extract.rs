@@ -49,7 +49,12 @@ pub fn require_song_access(
     song_id: SongId,
     action: Action,
 ) -> ApiResult<()> {
-    if authz::can(user.role, user.id, action, Resource::Song { owner_id, song_id }) {
+    if authz::can(
+        user.role,
+        user.id,
+        action,
+        Resource::Song { owner_id, song_id },
+    ) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)
@@ -57,7 +62,6 @@ pub fn require_song_access(
 }
 
 /// Same as [`AuthUser`] but rejects non-admin users.
-#[allow(dead_code)] // wired up in the admin routes phase
 #[derive(Debug, Clone)]
 pub struct AdminUser(pub User);
 

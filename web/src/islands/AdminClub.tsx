@@ -4,6 +4,7 @@ import {
   fetchAdminClubProposals,
   type AdminClubProposal,
 } from '../lib/api';
+import ErrorBoundary from './ErrorBoundary';
 
 export default function AdminClub() {
   const [rows, setRows] = useState<AdminClubProposal[]>([]);
@@ -26,19 +27,27 @@ export default function AdminClub() {
     refresh();
   }, [refresh]);
 
-  const handleDismiss = useCallback(
-    async (id: number) => {
-      const snapshot = rows;
-      setRows((prev) => prev.filter((r) => r.id !== id));
-      try {
-        await dismissClubProposal(id);
-      } catch {
-        setRows(snapshot);
-        alert('Failed to dismiss — try again.');
-      }
-    },
-    [rows]
-  );
+  const handleDismiss = useCallback(async (id: number) => {
+    // Roll back just this row, not the whole list — restoring a full
+    // pre-dismiss snapshot would resurrect any other row a concurrent
+    // dismiss had since (successfully) removed.
+    let removed: AdminClubProposal | undefined;
+    setRows((prev) => {
+      removed = prev.find((r) => r.id === id);
+      return prev.filter((r) => r.id !== id);
+    });
+    try {
+      await dismissClubProposal(id);
+    } catch {
+      setRows((prev) => {
+        if (!removed || prev.some((r) => r.id === id)) return prev;
+        return [...prev, removed].sort(
+          (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)
+        );
+      });
+      alert('Failed to dismiss — try again.');
+    }
+  }, []);
 
   if (loading) {
     return (
@@ -70,7 +79,9 @@ export default function AdminClub() {
   return (
     <ul className="space-y-3">
       {rows.map((p) => (
-        <ProposalCard key={p.id} proposal={p} onDismiss={handleDismiss} />
+        <ErrorBoundary key={p.id}>
+          <ProposalCard proposal={p} onDismiss={handleDismiss} />
+        </ErrorBoundary>
       ))}
     </ul>
   );

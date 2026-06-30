@@ -1,4 +1,5 @@
 import type { Features, Song, SongEvent } from '../lib/api';
+import ErrorBoundary from './ErrorBoundary';
 import SongCard from './SongCard';
 
 interface Props {
@@ -51,16 +52,17 @@ export default function SongList({
   return (
     <ul className="space-y-3">
       {songs.map((song) => (
-        <SongCard
-          key={song.id}
-          song={song}
-          features={features}
-          proposedClipIds={proposedClipIds}
-          onClubProposed={onClubProposed}
-          onUpdate={onUpdate}
-          onDelete={onDelete}
-          onRename={onRename}
-        />
+        <ErrorBoundary key={song.id}>
+          <SongCard
+            song={song}
+            features={features}
+            proposedClipIds={proposedClipIds}
+            onClubProposed={onClubProposed}
+            onUpdate={onUpdate}
+            onDelete={onDelete}
+            onRename={onRename}
+          />
+        </ErrorBoundary>
       ))}
     </ul>
   );

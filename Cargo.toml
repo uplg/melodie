@@ -11,7 +11,9 @@ members = [
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://github.com/leonardcherouvrier/melodie"
+repository = "https://github.com/uplg/melodie"
+# Internal app crates, never published to crates.io.
+publish = false
 
 [workspace.dependencies]
 # async runtime
@@ -39,7 +41,11 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 argon2 = "0.5"
 rand = "0.10"
 base64 = "0.22"
-time = { version = "0.3", default-features = false, features = ["std", "macros", "serde"] }
+# pinned exactly: 0.3.47 carries the RUSTSEC-2026-0009 fix, but 0.3.48+ changed
+# `Parsable::parse`'s signature in a way `cookie` 0.18.1 (unmaintained since
+# 2024, pulled in via tower-sessions' tower-cookies dep) doesn't build against.
+# A caret req would silently re-break on the next `cargo update`.
+time = { version = "=0.3.47", default-features = false, features = ["std", "macros", "serde"] }
 
 # logging
 tracing = "0.1"

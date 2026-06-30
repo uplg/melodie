@@ -13,8 +13,12 @@ fn main() -> Result<()> {
     let (nb, cin, cout, k, stride, l) = (2usize, 3usize, 2usize, 10usize, 5usize, 12usize);
 
     // deterministic inputs/weights, distinct per batch
-    let xv: Vec<f32> = (0..nb * cin * l).map(|i| ((i * 7 % 13) as f32) - 6.0).collect();
-    let wv: Vec<f32> = (0..cin * cout * k).map(|i| ((i * 5 % 11) as f32) - 5.0).collect();
+    let xv: Vec<f32> = (0..nb * cin * l)
+        .map(|i| ((i * 7 % 13) as f32) - 6.0)
+        .collect();
+    let wv: Vec<f32> = (0..cin * cout * k)
+        .map(|i| ((i * 5 % 11) as f32) - 5.0)
+        .collect();
     let x = Tensor::from_vec(xv.clone(), (nb, cin, l), &dev)?;
     let w = Tensor::from_vec(wv.clone(), (cin, cout, k), &dev)?;
 
@@ -34,7 +38,10 @@ fn main() -> Result<()> {
         }
     }
 
-    let cfg = ConvTranspose1dConfig { stride, ..Default::default() };
+    let cfg = ConvTranspose1dConfig {
+        stride,
+        ..Default::default()
+    };
     let y = ConvTranspose1d::new(w, None, cfg).forward(&x)?;
     let yv = y.flatten_all()?.to_vec1::<f32>()?;
 
@@ -48,7 +55,11 @@ fn main() -> Result<()> {
                 wi = i;
             }
         }
-        println!("batch n{n}: worst |Δ|={wd:.3e} at (oc{}, pos{})", wi / outlen, wi % outlen);
+        println!(
+            "batch n{n}: worst |Δ|={wd:.3e} at (oc{}, pos{})",
+            wi / outlen,
+            wi % outlen
+        );
     }
     Ok(())
 }

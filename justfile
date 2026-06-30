@@ -21,6 +21,20 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Unused deps, license/advisory/source policy (see deny.toml).
+deny:
+    cargo machete
+    cargo deny check
+
+# Everything an agent should run before calling a backend change done.
+# Mirrors CI; read-only (fmt --check, not `just fmt`, so it never mutates).
+gate:
+    cargo fmt --all -- --check
+    just check
+    just lint
+    just test
+    just deny
+
 run:
     cargo run -p melodie-api
 

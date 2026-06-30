@@ -26,10 +26,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/songs", post(create).get(list))
-        .route(
-            "/songs/{id}",
-            get(detail).delete(delete_song).patch(rename),
-        )
+        .route("/songs/{id}", get(detail).delete(delete_song).patch(rename))
         .route("/songs/{id}/events", get(events))
 }
 
@@ -183,15 +180,44 @@ async fn create(
     .await?;
 
     // Hand the work to the engine worker thread, which drives the clip/song
-    // updates and the SSE broadcast itself.
+    // updates and the SSE broadcast itself. `send` only fails if the worker
+    // already exited (e.g. model load failed) — in that case nothing will
+    // ever pick this job up, so treat it as a hard failure here rather than
+    // leaving the song stuck at "generating" forever with a quota slot burnt
+    // for nothing.
     if let Err(e) = state.engine.send(crate::engine::EngineJob {
         song_id,
-        clip_id,
+        clip_id: clip_id.clone(),
         lyrics,
         tags,
         max_frames: 2250,
     }) {
         tracing::error!(error = %e, %song_id, "engine: failed to enqueue job");
+        let _ = melodie_db::songs::set_status(
+            &state.db,
+            song_id,
+            SongStatus::Failed,
+            Some("generation engine is unavailable"),
+        )
+        .await;
+        let _ = melodie_db::clips::upsert_many(
+            &state.db,
+            &[UpsertClip {
+                id: clip_id,
+                song_id,
+                variant_index: 0,
+                status: "error".into(),
+                duration_s: None,
+                image_url: None,
+            }],
+        )
+        .await;
+        if user.role != melodie_core::model::Role::Admin {
+            let _ = melodie_db::quota::decrement(&state.db, user.id).await;
+        }
+        return Err(ApiError::ServiceUnavailable(
+            "generation engine is unavailable".into(),
+        ));
     }
 
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
@@ -263,7 +289,10 @@ async fn events(
     // here makes it harder to forget on some intermediaries.
     let mut headers = HeaderMap::new();
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
-    headers.insert("cache-control", HeaderValue::from_static("no-cache, no-transform"));
+    headers.insert(
+        "cache-control",
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
 
     Ok((headers, sse))
 }
@@ -330,6 +359,20 @@ async fn delete_song(
     require_song_access(&user, song.owner_id, song_id, Action::Delete)?;
 
     melodie_db::songs::delete(&state.db, song_id).await?;
+
+    // Best-effort: the DB row is already gone either way, so a failed/missing
+    // file here shouldn't fail the request — but leaving these on disk leaks
+    // unbounded space over the server's lifetime since nothing else tracks
+    // them once the clip row is deleted.
+    for clip in &song.clips {
+        let path = state.audio_dir.join(format!("{}.mp3", clip.id));
+        if let Err(e) = tokio::fs::remove_file(&path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, clip_id = %clip.id, "failed to remove audio file on song delete");
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 

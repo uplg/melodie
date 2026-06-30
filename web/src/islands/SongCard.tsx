@@ -138,6 +138,7 @@ export default function SongCard({
           {editing ? (
             <input
               autoFocus
+              aria-label="Song title"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
@@ -290,7 +291,14 @@ function ClipSlot({
         <p className="text-xs text-red-600 dark:text-red-400">Generation failed.</p>
       ) : (
         <div className="space-y-1">
-          <div className="h-2 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+          <div
+            role="progressbar"
+            aria-label="Generation progress"
+            aria-valuenow={progress ?? 0}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            className="h-2 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800"
+          >
             <div
               className="h-full rounded-full bg-amber-500 transition-[width] duration-500 ease-out"
               style={{ width: `${progress ?? 0}%` }}
@@ -321,10 +329,15 @@ function ClubProposeButton({
   }
 
   const handleClick = async () => {
+    // The backend/admin view both already support an optional note (shown on
+    // the admin club page) — this was the only missing link to actually let
+    // a friend attach one.
+    const raw = window.prompt('Optional note for the operator (leave blank to skip):');
+    if (raw === null) return; // cancelled the whole propose action
     setBusy(true);
     setError(null);
     try {
-      await proposeClipForClub(clipId);
+      await proposeClipForClub(clipId, raw.trim() || undefined);
       setDone(true);
       onClubProposed(clipId);
     } catch (e) {

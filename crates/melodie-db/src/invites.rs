@@ -23,12 +23,15 @@ impl Invite {
     }
 }
 
-pub async fn find(pool: &SqlitePool, code: &str) -> Result<Option<Invite>, DbError> {
+pub async fn find<'e, E>(executor: E, code: &str) -> Result<Option<Invite>, DbError>
+where
+    E: sqlx::SqliteExecutor<'e>,
+{
     let row = sqlx::query_as::<_, Invite>(
         "SELECT code, created_by, used_by, role, created_at, expires_at FROM invites WHERE code = ?",
     )
     .bind(code)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row)
 }
@@ -108,15 +111,94 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<InviteListRow>, DbError> {
 
 /// Atomically mark the invite as consumed by `user_id`. Returns true if the
 /// invite was unused and is now bound to this user, false if it was already
-/// consumed (or doesn't exist / is expired).
-pub async fn consume(pool: &SqlitePool, code: &str, user_id: UserId) -> Result<bool, DbError> {
+/// consumed (or doesn't exist / is expired). Generic over the executor so the
+/// caller can run this inside a transaction alongside creating the user it
+/// grants — see `routes/auth.rs::signup`, which claims the invite *before*
+/// the user row exists so a lost race never leaves an orphaned account.
+pub async fn consume<'e, E>(executor: E, code: &str, user_id: UserId) -> Result<bool, DbError>
+where
+    E: sqlx::SqliteExecutor<'e>,
+{
     let res = sqlx::query(
         "UPDATE invites SET used_by = ? WHERE code = ? AND used_by IS NULL \
          AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
     )
     .bind(user_id.to_string())
     .bind(code)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(res.rows_affected() == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert_invite(pool: &SqlitePool, code: &str) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO invites (code, created_by, role) VALUES (?, NULL, 'member')")
+            .bind(code)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_user(pool: &SqlitePool, id: UserId) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, 'tester', 'x')",
+        )
+        .bind(id.to_string())
+        .bind(format!("{id}@test.invalid"))
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn consume_claims_an_unused_invite(pool: SqlitePool) -> Result<(), DbError> {
+        insert_invite(&pool, "abc123").await?;
+        let user = UserId::new();
+        insert_user(&pool, user).await?;
+        assert!(consume(&pool, "abc123", user).await?);
+        let invite = find(&pool, "abc123").await?.expect("invite still exists");
+        assert_eq!(invite.used_by.as_deref(), Some(user.to_string().as_str()));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn consume_rejects_an_already_used_invite(pool: SqlitePool) -> Result<(), DbError> {
+        insert_invite(&pool, "abc123").await?;
+        let user_a = UserId::new();
+        let user_b = UserId::new();
+        insert_user(&pool, user_a).await?;
+        insert_user(&pool, user_b).await?;
+        assert!(consume(&pool, "abc123", user_a).await?);
+        assert!(!consume(&pool, "abc123", user_b).await?);
+        Ok(())
+    }
+
+    /// The bug this guards against: two signups racing the same invite code
+    /// must not both be told they claimed it — `routes/auth.rs::signup` relies
+    /// on exactly one winner to know which request gets to create the account.
+    #[sqlx::test]
+    async fn consume_race_has_exactly_one_winner(pool: SqlitePool) -> Result<(), DbError> {
+        insert_invite(&pool, "abc123").await?;
+        let user_a = UserId::new();
+        let user_b = UserId::new();
+        insert_user(&pool, user_a).await?;
+        insert_user(&pool, user_b).await?;
+
+        let (a, b) = tokio::join!(
+            consume(&pool, "abc123", user_a),
+            consume(&pool, "abc123", user_b),
+        );
+        let winners = [a, b].into_iter().filter(|r| matches!(r, Ok(true))).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one concurrent consume should claim the invite"
+        );
+
+        let invite = find(&pool, "abc123").await?.expect("invite still exists");
+        assert!(invite.used_by.is_some());
+        Ok(())
+    }
 }

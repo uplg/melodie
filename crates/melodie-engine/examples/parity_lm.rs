@@ -5,9 +5,9 @@
 use std::path::Path;
 
 use candle_core::Device;
+use melodie_engine::Result;
 use melodie_engine::lm::{HeartMuLaLm, LmWeights};
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/lm_frame0.safetensors";
 const LM: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartMuLa-oss-3B";
@@ -29,7 +29,10 @@ fn main() -> Result<()> {
     let (last_h, c0) = lm.backbone_c0(tokens, mask)?;
     let d0 = max_abs_diff(&c0, c0_g)?;
     let rms0 = c0_g.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
-    println!("backbone c0_logits {:?}  max|Δ|={d0:.3e}  (rms={rms0:.3e})", c0.dims());
+    println!(
+        "backbone c0_logits {:?}  max|Δ|={d0:.3e}  (rms={rms0:.3e})",
+        c0.dims()
+    );
 
     println!("depth decoder (replaying samples)...");
     let ci = lm.depth_ci(&last_h, samples)?;
@@ -52,6 +55,13 @@ fn main() -> Result<()> {
     println!("  rust samples   = {gen_i:?}");
     println!("  golden samples = {curr_g:?}  match={samples_ok}");
 
-    println!("{}", if logits_ok && samples_ok { "LM PARITY OK ✅" } else { "LM PARITY OFF ❌" });
+    println!(
+        "{}",
+        if logits_ok && samples_ok {
+            "LM PARITY OK ✅"
+        } else {
+            "LM PARITY OFF ❌"
+        }
+    );
     Ok(())
 }

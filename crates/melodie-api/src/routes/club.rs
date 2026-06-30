@@ -63,8 +63,7 @@ async fn propose(
         .ok_or(ApiError::NotFound)?;
     require_song_access(&user, owner_id, clip.song_id, Action::Read)?;
 
-    let outcome =
-        melodie_db::club::propose(&state.db, &clip_id, user.id, note.as_deref()).await?;
+    let outcome = melodie_db::club::propose(&state.db, &clip_id, user.id, note.as_deref()).await?;
     let status = match outcome {
         ProposeOutcome::Created => StatusCode::CREATED,
         ProposeOutcome::AlreadyProposed => StatusCode::OK,
@@ -147,7 +146,9 @@ async fn list_admin(
     _admin: AdminUser,
 ) -> ApiResult<Json<Vec<AdminProposalView>>> {
     let rows = melodie_db::club::list(&state.db).await?;
-    Ok(Json(rows.into_iter().map(AdminProposalView::from).collect()))
+    Ok(Json(
+        rows.into_iter().map(AdminProposalView::from).collect(),
+    ))
 }
 
 async fn delete_admin(

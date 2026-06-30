@@ -267,8 +267,12 @@ export async function resetAllQuotas(): Promise<void> {
  * through the merge — TS otherwise widens to plain `Song`.
  */
 export function applySongEvent<T extends Song>(song: T, ev: SongEvent): T {
+  // `ev.clips` is trusted JSON off the wire (SSE `JSON.parse`, or a fetch
+  // response) — a shape drift on the backend (or a malformed frame) shouldn't
+  // throw here and blank the whole list for every song mid-render.
+  const evClips = Array.isArray(ev.clips) ? ev.clips : [];
   const updatedClips = song.clips.map((c) => {
-    const u = ev.clips.find((uc) => uc.id === c.id);
+    const u = evClips.find((uc) => uc.id === c.id);
     if (!u) return c;
     return {
       ...c,
@@ -278,7 +282,7 @@ export function applySongEvent<T extends Song>(song: T, ev: SongEvent): T {
     };
   });
   // SSE may report clips the song doesn't yet know about (rare; defensive).
-  for (const u of ev.clips) {
+  for (const u of evClips) {
     if (!updatedClips.some((c) => c.id === u.id)) {
       updatedClips.push({
         id: u.id,
@@ -289,5 +293,5 @@ export function applySongEvent<T extends Song>(song: T, ev: SongEvent): T {
       });
     }
   }
-  return { ...song, status: ev.status, clips: updatedClips };
+  return { ...song, status: ev.status ?? song.status, clips: updatedClips };
 }

@@ -112,7 +112,13 @@ fn conv1d_chunked(
     let lp = xpadded.dim(2)?;
     let recep = (k - 1) * dilation; // span beyond the first output sample
     let lo = (lp - recep - 1) / stride + 1; // total output length
-    let cfg = Conv1dConfig { padding: 0, stride, dilation, groups: 1, ..Default::default() };
+    let cfg = Conv1dConfig {
+        padding: 0,
+        stride,
+        dilation,
+        groups: 1,
+        ..Default::default()
+    };
     let conv = Conv1d::new(w.clone(), Some(b.clone()), cfg);
     if lo <= CHUNK {
         return Ok(conv.forward(xpadded)?);
@@ -316,7 +322,12 @@ impl ScalarDecoder {
                     a2: w.prelu(&format!("{p}.activation2.weight"))?,
                 });
             }
-            blocks.push(ResDecoderBlock { up_w, up_b, stride, units });
+            blocks.push(ResDecoderBlock {
+                up_w,
+                up_b,
+                stride,
+                units,
+            });
         }
 
         let post = PostProcessor {
@@ -328,7 +339,14 @@ impl ScalarDecoder {
         let conv7_w = w.fused("scalar_model.decoder.7")?;
         let conv7_b = w.raw("scalar_model.decoder.7.bias")?;
 
-        Ok(Self { conv0_w, conv0_b, blocks, post, conv7_w, conv7_b })
+        Ok(Self {
+            conv0_w,
+            conv0_b,
+            blocks,
+            post,
+            conv7_w,
+            conv7_b,
+        })
     }
 
     /// Decode a latent `(N, L, 128)` (MLX-layout, as dumped) → waveform `(N, L*1920)`.
@@ -345,9 +363,14 @@ impl ScalarDecoder {
     pub fn decode(&self, latent_nlc: &Tensor) -> Result<Tensor> {
         // Large chunk + minimal context (≈ the ~48-frame receptive span, +margin) keeps the
         // re-decoded overlap small while still bounding the batched activations.
-        let ch =
-            std::env::var("MELODIE_DECODE_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(384);
-        let r = std::env::var("MELODIE_DECODE_R").ok().and_then(|s| s.parse().ok()).unwrap_or(52);
+        let ch = std::env::var("MELODIE_DECODE_CH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384);
+        let r = std::env::var("MELODIE_DECODE_R")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(52);
         self.decode_streaming(latent_nlc, ch, r)
     }
 
@@ -434,7 +457,13 @@ impl HeartCodec {
 
     /// Decode one segment: codes `(1,Q,T)` + initial `noise` `(1,2T,256)` → waveform `(2, 2T*1920)`.
     /// (Single-segment path; multi-segment overlap-add is layered on top later.)
-    pub fn detokenize_segment(&self, codes: &Tensor, noise: &Tensor, num_steps: usize, gs: f64) -> Result<Tensor> {
+    pub fn detokenize_segment(
+        &self,
+        codes: &Tensor,
+        noise: &Tensor,
+        num_steps: usize,
+        gs: f64,
+    ) -> Result<Tensor> {
         let fm_latents = self.fm.inference(codes, noise, num_steps, gs)?; // (1,2T,256)
         let (b, t2, f) = fm_latents.dims3()?;
         // reshape (B,2T,256) -> (B,2T,2,128) -> (B,2,2T,128) -> (2B,2T,128)  (modeling_heartcodec.py:184-186)
@@ -547,7 +576,8 @@ impl HeartCodec {
                     latent_length,
                     incontext_length: 0,
                 };
-                self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
+                self.fm
+                    .inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
             } else {
                 // Subsequent segment: last `ovlp_frames` latents of the previous segment
                 // become the in-context prefix, padded with randn to length.
@@ -563,7 +593,8 @@ impl HeartCodec {
                     latent_length,
                     incontext_length: ovlp_frames,
                 };
-                self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
+                self.fm
+                    .inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
             };
 
             // Decode this segment NOW (interleaved). (B,T,256) → (B,T,2,128) → (2B,T,128).
@@ -595,8 +626,8 @@ impl HeartCodec {
                         let cur_rest =
                             cur.narrow(1, ovlp_samples_audio, cur.dim(1)? - ovlp_samples_audio)?;
                         // blended = prev_tail*(1-win) + cur_head*win
-                        let blended = (prev_tail.broadcast_mul(&win_inv)?
-                            + cur_head.broadcast_mul(win)?)?;
+                        let blended =
+                            (prev_tail.broadcast_mul(&win_inv)? + cur_head.broadcast_mul(win)?)?;
                         Tensor::cat(&[&prev_head, &blended, &cur_rest], 1)?
                     }
                 }

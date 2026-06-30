@@ -3,9 +3,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-// Some variants are wired in later phases (admin endpoints, generation
-// quota); keep them defined now to avoid churn on the IntoResponse impl.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("not authenticated")]
@@ -32,6 +29,12 @@ pub enum ApiError {
     #[error(transparent)]
     Db(#[from] melodie_db::DbError),
 
+    /// Raw sqlx errors from transactions opened directly in a handler (e.g.
+    /// `routes/auth.rs::signup`'s invite-claim transaction), as opposed to
+    /// `Db`, which wraps errors from melodie-db's query functions.
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+
     #[error(transparent)]
     Session(#[from] tower_sessions::session::Error),
 
@@ -49,7 +52,7 @@ impl ApiError {
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
-            Self::Db(_) | Self::Session(_) | Self::Internal(_) => {
+            Self::Db(_) | Self::Sqlx(_) | Self::Session(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
         }
@@ -64,7 +67,15 @@ impl IntoResponse for ApiError {
         } else {
             tracing::debug!(error = %self, status = %status, "request failed");
         }
-        let body = Json(json!({ "error": { "code": code, "message": self.to_string() } }));
+        // 5xx variants wrap raw driver/library errors (sqlx, argon2, reqwest)
+        // that can carry file paths, hostnames, or query fragments — the
+        // detailed text goes to the log above, never to the client.
+        let message = if status.is_server_error() {
+            "internal error".to_string()
+        } else {
+            self.to_string()
+        };
+        let body = Json(json!({ "error": { "code": code, "message": message } }));
         (status, body).into_response()
     }
 }

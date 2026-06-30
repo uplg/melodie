@@ -4,10 +4,10 @@
 use std::path::Path;
 
 use candle_core::{Device, Tensor};
+use melodie_engine::Result;
 use melodie_engine::codec::{CodecWeights, DetokCb, HeartCodec};
 use melodie_engine::config::HeartCodecConfig;
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/detok.safetensors";
 const CKPT: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss";
@@ -35,7 +35,11 @@ fn main() -> Result<()> {
     let err_rms = diff.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
     let av: Vec<f32> = diff.abs()?.flatten_all()?.to_vec1()?;
     let n_big = av.iter().filter(|&&x| x > 1e-3).count();
-    println!("waveform {:?} (golden {:?})  max|Δ|={d:.3e}  rms={rms:.3e}", wav.dims(), wav_g.dims());
+    println!(
+        "waveform {:?} (golden {:?})  max|Δ|={d:.3e}  rms={rms:.3e}",
+        wav.dims(),
+        wav_g.dims()
+    );
     println!(
         "  error RMS={err_rms:.3e}; |Δ|>1e-3 on {n_big}/{} samples ({:.3}%) — sparse round9 flips",
         av.len(),
@@ -58,15 +62,37 @@ fn main() -> Result<()> {
     let mut streamed: Vec<f32> = Vec::new();
     let full = {
         let mut on_audio = |pcm: &[f32]| streamed.extend_from_slice(pcm);
-        codec.detokenize(&many, None, 7.44, 10, 1.25, DetokCb { on_audio: Some(&mut on_audio), ..Default::default() })?
+        codec.detokenize(
+            &many,
+            None,
+            7.44,
+            10,
+            1.25,
+            DetokCb {
+                on_audio: Some(&mut on_audio),
+                ..Default::default()
+            },
+        )?
     };
-    let interleaved: Vec<f32> = full.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1()?;
-    let sd = streamed.iter().zip(&interleaved).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let interleaved: Vec<f32> = full
+        .transpose(0, 1)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1()?;
+    let sd = streamed
+        .iter()
+        .zip(&interleaved)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     println!(
         "streamed {} samples vs returned {}  max|Δ|={sd:.3e}  {}",
         streamed.len(),
         interleaved.len(),
-        if streamed.len() == interleaved.len() && sd == 0.0 { "STREAM==RETURN ✅" } else { "STREAM MISMATCH ❌" }
+        if streamed.len() == interleaved.len() && sd == 0.0 {
+            "STREAM==RETURN ✅"
+        } else {
+            "STREAM MISMATCH ❌"
+        }
     );
     Ok(())
 }

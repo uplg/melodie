@@ -4,11 +4,11 @@
 use std::path::Path;
 
 use candle_core::Device;
+use melodie_engine::Result;
 use melodie_engine::codec::CodecWeights;
 use melodie_engine::config::HeartCodecConfig;
 use melodie_engine::flow::Dit;
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/codec_seg0.safetensors";
 const CKPT: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss";
@@ -28,7 +28,17 @@ fn main() -> Result<()> {
     let out = dit.forward(est_in, est_t)?;
     let d = max_abs_diff(&out, est_out_g)?;
     let rms = est_out_g.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
-    println!("DiT estimator: out {:?}  max|Δ|={d:.3e}  (golden rms={rms:.3e})", out.dims());
-    println!("{}", if d < 1e-3 { "DiT PARITY OK ✅" } else { "DiT PARITY OFF ❌" });
+    println!(
+        "DiT estimator: out {:?}  max|Δ|={d:.3e}  (golden rms={rms:.3e})",
+        out.dims()
+    );
+    println!(
+        "{}",
+        if d < 1e-3 {
+            "DiT PARITY OK ✅"
+        } else {
+            "DiT PARITY OFF ❌"
+        }
+    );
     Ok(())
 }

@@ -4,6 +4,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind: SocketAddr,
+    /// Base URL this server is reachable at from *other local services*
+    /// (currently: homie fetching clip audio for push-to-live). Defaults to
+    /// loopback on `bind`'s port — never derived from a request, since the
+    /// client-supplied `Host` header is trivially spoofable.
+    pub local_base_url: String,
     pub database_url: String,
     pub bootstrap_invite: Option<String>,
     pub cookie_secure: bool,
@@ -35,9 +40,15 @@ pub struct HomiePushConfig {
 
 impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        let bind = std::env::var("MELODIE_BIND")
+        let bind: SocketAddr = std::env::var("MELODIE_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()?;
+
+        let local_base_url = std::env::var("MELODIE_LOCAL_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", bind.port()));
 
         let database_url = std::env::var("MELODIE_DATABASE_URL")
             .unwrap_or_else(|_| "sqlite://./data/melodie.db?mode=rwc".into());
@@ -56,6 +67,7 @@ impl AppConfig {
 
         Ok(Self {
             bind,
+            local_base_url,
             database_url,
             bootstrap_invite,
             cookie_secure,

@@ -4,10 +4,10 @@
 use std::path::Path;
 
 use candle_core::{Device, Tensor};
+use melodie_engine::Result;
 use melodie_engine::codec::{CodecWeights, ScalarDecoder};
 use melodie_engine::config::HeartCodecConfig;
 use melodie_engine::parity::max_abs_diff;
-use melodie_engine::Result;
 
 const GOLDEN: &str = "crates/melodie-engine/reference/golden/codec_seg0.safetensors";
 const CKPT: &str = "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss";
@@ -33,7 +33,11 @@ fn main() -> Result<()> {
 
     let wav = dec.decode(latent_in)?;
     let d = max_abs_diff(&wav, &golden["waveform"])?;
-    let rms = golden["waveform"].sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+    let rms = golden["waveform"]
+        .sqr()?
+        .mean_all()?
+        .sqrt()?
+        .to_scalar::<f32>()?;
     println!("waveform {:?}  max|Δ|={d:.3e}  (rms={rms:.3e})", wav.dims());
     println!(
         "{}",
@@ -56,7 +60,10 @@ fn main() -> Result<()> {
         let s = dec.decode_streaming(&big, 64, r)?;
         let m = dlen.min(s.dim(1)?);
         let sd = max_abs_diff(&dense.narrow(1, 0, m)?, &s.narrow(1, 0, m)?)?;
-        println!("  CH=64 R={r:3} → max|Δ|={sd:.3e}  (stream len={})", s.dim(1)?);
+        println!(
+            "  CH=64 R={r:3} → max|Δ|={sd:.3e}  (stream len={})",
+            s.dim(1)?
+        );
     }
     Ok(())
 }

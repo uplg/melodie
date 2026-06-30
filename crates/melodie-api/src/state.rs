@@ -26,6 +26,10 @@ pub struct AppState {
     /// Directory holding generated `.mp3` files, served by
     /// `GET /api/clips/{id}/audio`.
     pub audio_dir: Arc<PathBuf>,
+    /// This server's own base URL, as reachable from other local services —
+    /// see `AppConfig::local_base_url`. Used to build the audio URL handed to
+    /// homie's push server, never the request's `Host` header.
+    pub local_base_url: Arc<str>,
 }
 
 impl AppState {
@@ -35,6 +39,7 @@ impl AppState {
         homie_push: Option<Arc<HomiePushConfig>>,
         engine: EngineHandle,
         audio_dir: Arc<PathBuf>,
+        local_base_url: Arc<str>,
     ) -> Self {
         Self {
             db,
@@ -42,6 +47,7 @@ impl AppState {
             homie_push,
             engine,
             audio_dir,
+            local_base_url,
         }
     }
 }

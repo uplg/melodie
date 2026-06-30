@@ -42,7 +42,12 @@ pub struct GenOptions {
 
 impl Default for GenOptions {
     fn default() -> Self {
-        Self { max_frames: 2250, cfg_scale: 1.5, topk: 50, temperature: 1.0 }
+        Self {
+            max_frames: 2250,
+            cfg_scale: 1.5,
+            topk: 50,
+            temperature: 1.0,
+        }
     }
 }
 
@@ -95,7 +100,8 @@ impl Audio {
         {
             let mut w = hound::WavWriter::new(&mut cursor, spec).map_err(wav_err)?;
             for &s in &self.samples {
-                w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).map_err(wav_err)?;
+                w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .map_err(wav_err)?;
             }
             w.finalize().map_err(wav_err)?;
         }
@@ -137,7 +143,14 @@ impl Engine {
         let cw = CodecWeights::load(&cfg.codec_dir, &dev)?;
         let codec_cfg = HeartCodecConfig::default();
         let codec = HeartCodec::load(&cw, &codec_cfg, &dev)?;
-        Ok(Self { tok, lm, codec, dev, gcfg: GenConfig::default(), codec_cfg })
+        Ok(Self {
+            tok,
+            lm,
+            codec,
+            dev,
+            gcfg: GenConfig::default(),
+            codec_cfg,
+        })
     }
 
     /// Generate a song from `lyrics` and style `tags`. Blocking and single-threaded.
@@ -161,7 +174,11 @@ impl Engine {
             // Map LM frame counts → progress reports. Scoped so the mutable borrow of
             // `on` is released before the codec stage takes its own.
             let mut on_frame = |done: usize, total: usize| {
-                on(GenProgress { stage: GenStage::Lm, done, total });
+                on(GenProgress {
+                    stage: GenStage::Lm,
+                    done,
+                    total,
+                });
             };
             self.lm.generate_codes(
                 &p.tokens,
@@ -178,7 +195,9 @@ impl Engine {
         };
         let t = codes.dim(1)?;
         if t == 0 {
-            return Err(EngineError::Config("model emitted EOS immediately (no audio)".into()));
+            return Err(EngineError::Config(
+                "model emitted EOS immediately (no audio)".into(),
+            ));
         }
         // Release the LM's generation residency (per-frame intermediates + dropped KV cache)
         // before the codec runs. Otherwise the whole song's LM pool stays live on the GPU
@@ -191,7 +210,11 @@ impl Engine {
         // segment draws its flow-matching latent with randn internally.
         let wav = {
             let mut on_seg = |done: usize, total: usize| {
-                on(GenProgress { stage: GenStage::Codec, done, total });
+                on(GenProgress {
+                    stage: GenStage::Codec,
+                    done,
+                    total,
+                });
             };
             self.codec.detokenize(
                 &codes.unsqueeze(0)?,
@@ -199,18 +222,28 @@ impl Engine {
                 self.codec_cfg.segment_duration,
                 self.codec_cfg.flow_num_steps,
                 self.codec_cfg.flow_guidance_scale,
-                DetokCb { on_seg: Some(&mut on_seg), ..Default::default() },
+                DetokCb {
+                    on_seg: Some(&mut on_seg),
+                    ..Default::default()
+                },
             )?
         }; // [2, N] f32 @ 48 kHz
         let (channels, n) = wav.dims2()?;
         let ch0: Vec<f32> = wav.narrow(0, 0, 1)?.flatten_all()?.to_vec1()?;
-        let ch1: Vec<f32> = wav.narrow(0, 1.min(channels - 1), 1)?.flatten_all()?.to_vec1()?;
+        let ch1: Vec<f32> = wav
+            .narrow(0, 1.min(channels - 1), 1)?
+            .flatten_all()?
+            .to_vec1()?;
         let mut samples = Vec::with_capacity(n * 2);
         for i in 0..n {
             samples.push(ch0[i]);
             samples.push(ch1[i]);
         }
-        Ok(Audio { samples, sample_rate: self.codec_cfg.sample_rate as u32, channels: 2.min(channels.max(1)) as u16 })
+        Ok(Audio {
+            samples,
+            sample_rate: self.codec_cfg.sample_rate as u32,
+            channels: 2.min(channels.max(1)) as u16,
+        })
     }
 
     /// Generate a song, STREAMING each finalised interleaved-stereo PCM chunk to `on_audio`
@@ -228,7 +261,11 @@ impl Engine {
         let p = preprocess(&self.tok, &self.gcfg, tags, lyrics, &self.dev)?;
         let codes = {
             let mut on_frame = |done: usize, total: usize| {
-                on_progress(GenProgress { stage: GenStage::Lm, done, total });
+                on_progress(GenProgress {
+                    stage: GenStage::Lm,
+                    done,
+                    total,
+                });
             };
             self.lm.generate_codes(
                 &p.tokens,
@@ -244,12 +281,18 @@ impl Engine {
             )?
         };
         if codes.dim(1)? == 0 {
-            return Err(EngineError::Config("model emitted EOS immediately (no audio)".into()));
+            return Err(EngineError::Config(
+                "model emitted EOS immediately (no audio)".into(),
+            ));
         }
         self.dev.synchronize()?;
         let wav = {
             let mut on_seg = |done: usize, total: usize| {
-                on_progress(GenProgress { stage: GenStage::Codec, done, total });
+                on_progress(GenProgress {
+                    stage: GenStage::Codec,
+                    done,
+                    total,
+                });
             };
             self.codec.detokenize(
                 &codes.unsqueeze(0)?,
@@ -257,7 +300,10 @@ impl Engine {
                 self.codec_cfg.segment_duration,
                 self.codec_cfg.flow_num_steps,
                 self.codec_cfg.flow_guidance_scale,
-                DetokCb { on_seg: Some(&mut on_seg), on_audio: Some(&mut *on_audio) },
+                DetokCb {
+                    on_seg: Some(&mut on_seg),
+                    on_audio: Some(&mut *on_audio),
+                },
             )?
         };
         Ok(wav.dim(1)? as f64 / self.codec_cfg.sample_rate as f64)
@@ -270,5 +316,6 @@ impl Engine {
 }
 
 fn path_str(p: &Path) -> Result<&str> {
-    p.to_str().ok_or_else(|| EngineError::Config(format!("non-UTF-8 path: {}", p.display())))
+    p.to_str()
+        .ok_or_else(|| EngineError::Config(format!("non-UTF-8 path: {}", p.display())))
 }

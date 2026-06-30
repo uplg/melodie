@@ -28,7 +28,14 @@ fn bench_dtype(dev: &Device, m: usize, k: usize, n: usize, iters: usize, dt: DTy
     Ok(())
 }
 
-fn bench_matmul(dev: &Device, name: &str, m: usize, k: usize, n: usize, iters: usize) -> Result<()> {
+fn bench_matmul(
+    dev: &Device,
+    name: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: usize,
+) -> Result<()> {
     let x = Tensor::randn(0f32, 1.0, (m, k), dev)?;
     let w = Tensor::randn(0f32, 1.0, (k, n), dev)?;
     for _ in 0..20 {
@@ -63,7 +70,14 @@ fn bench_op(dev: &Device, name: &str, numel: usize, iters: usize) -> Result<()> 
     Ok(())
 }
 
-fn bench_named(dev: &Device, name: &str, shape: (usize, usize, usize, usize), dt: DType, iters: usize, op: impl Fn(&Tensor) -> Result<Tensor>) -> Result<()> {
+fn bench_named(
+    dev: &Device,
+    name: &str,
+    shape: (usize, usize, usize, usize),
+    dt: DType,
+    iters: usize,
+    op: impl Fn(&Tensor) -> Result<Tensor>,
+) -> Result<()> {
     let x = Tensor::randn(0f32, 1.0, shape, dev)?.to_dtype(dt)?;
     for _ in 0..20 {
         sync(&op(&x)?)?;
@@ -74,7 +88,10 @@ fn bench_named(dev: &Device, name: &str, shape: (usize, usize, usize, usize), dt
         y = op(&x)?;
     }
     sync(&y)?;
-    println!("  {name:10} {dt:?}: {:.4} ms/op", t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "  {name:10} {dt:?}: {:.4} ms/op",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
     Ok(())
 }
 
@@ -90,17 +107,23 @@ fn rmsnorm(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
 
 // one transformer layer's compute (matmuls + rmsnorm + silu), 1 token, no attention cache
 fn bench_layer(dev: &Device, dt: DType, iters: usize) -> Result<()> {
-    let mk = |a, b| -> Result<Tensor> { Ok(Tensor::randn(0f32, 1.0, (a, b), dev)?.to_dtype(dt).unwrap()) };
+    let mk = |a, b| -> Result<Tensor> {
+        Ok(Tensor::randn(0f32, 1.0, (a, b), dev)?.to_dtype(dt).unwrap())
+    };
     let x0 = Tensor::randn(0f32, 1.0, (1, 1, 3072), dev)?.to_dtype(dt)?;
     let (wq, wo) = (mk(3072, 3072)?, mk(3072, 3072)?);
     let (w1, w2, w3) = (mk(3072, 8192)?, mk(8192, 3072)?, mk(3072, 8192)?);
-    let (n1, n2) = (Tensor::randn(0f32, 1.0, (3072,), dev)?.to_dtype(dt)?, Tensor::randn(0f32, 1.0, (3072,), dev)?.to_dtype(dt)?);
+    let (n1, n2) = (
+        Tensor::randn(0f32, 1.0, (3072,), dev)?.to_dtype(dt)?,
+        Tensor::randn(0f32, 1.0, (3072,), dev)?.to_dtype(dt)?,
+    );
     let step = |x: &Tensor| -> Result<Tensor> {
         let h = rmsnorm(x, &n1)?;
         let a = h.broadcast_matmul(&wq)?.broadcast_matmul(&wo)?; // q then o proj
         let r = (x + a)?;
         let h2 = rmsnorm(&r, &n2)?;
-        let m = (candle_nn::ops::silu(&h2.broadcast_matmul(&w1)?)? * h2.broadcast_matmul(&w3)?)?.broadcast_matmul(&w2)?;
+        let m = (candle_nn::ops::silu(&h2.broadcast_matmul(&w1)?)? * h2.broadcast_matmul(&w3)?)?
+            .broadcast_matmul(&w2)?;
         Ok((r + m)?)
     };
     for _ in 0..30 {
@@ -112,7 +135,10 @@ fn bench_layer(dev: &Device, dt: DType, iters: usize) -> Result<()> {
         x = step(&x0)?;
     }
     sync(&x)?;
-    println!("  layer {dt:?}: {:.4} ms/layer", t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "  layer {dt:?}: {:.4} ms/layer",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
     Ok(())
 }
 
@@ -125,14 +151,20 @@ fn bench_attn(dev: &Device, dt: DType, iters: usize) -> Result<()> {
     let v = Tensor::randn(0f32, 1.0, (1, nkv, skv, dh), dev)?.to_dtype(dt)?;
     let expand = |x: &Tensor, rep: usize| -> Result<Tensor> {
         let (b, nk, s, d) = x.dims4()?;
-        Ok(x.unsqueeze(2)?.broadcast_as((b, nk, rep, s, d))?.contiguous()?.reshape((b, nk * rep, s, d))?)
+        Ok(x.unsqueeze(2)?
+            .broadcast_as((b, nk, rep, s, d))?
+            .contiguous()?
+            .reshape((b, nk * rep, s, d))?)
     };
     let step = || -> Result<Tensor> {
         let ke = expand(&k, h / nkv)?;
         let ve = expand(&v, h / nkv)?;
         let scores = (q.matmul(&ke.transpose(2, 3)?.contiguous()?)? / (dh as f64).sqrt())?;
         let w = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        Ok(w.matmul(&ve)?.transpose(1, 2)?.contiguous()?.reshape((1, 1, h * dh))?)
+        Ok(w.matmul(&ve)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((1, 1, h * dh))?)
     };
     for _ in 0..30 {
         sync(&step()?)?;
@@ -143,7 +175,10 @@ fn bench_attn(dev: &Device, dt: DType, iters: usize) -> Result<()> {
         y = step()?;
     }
     sync(&y)?;
-    println!("  attn {dt:?}: {:.4} ms/op", t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "  attn {dt:?}: {:.4} ms/op",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
     Ok(())
 }
 
@@ -158,20 +193,47 @@ fn bench_bb_attn(dev: &Device, skv: usize, dt: DType) -> Result<()> {
     let vn = Tensor::randn(0f32, 1.0, (b, nkv, 1, dh), dev)?.to_dtype(dt)?;
     let step = || -> Result<Tensor> {
         // expand new kv 8->24, append to cache (the cat), then attend over skv+1
-        let ke = kn.unsqueeze(2)?.broadcast_as((b, nkv, h / nkv, 1, dh))?.contiguous()?.reshape((b, h, 1, dh))?;
-        let ve = vn.unsqueeze(2)?.broadcast_as((b, nkv, h / nkv, 1, dh))?.contiguous()?.reshape((b, h, 1, dh))?;
+        let ke = kn
+            .unsqueeze(2)?
+            .broadcast_as((b, nkv, h / nkv, 1, dh))?
+            .contiguous()?
+            .reshape((b, h, 1, dh))?;
+        let ve = vn
+            .unsqueeze(2)?
+            .broadcast_as((b, nkv, h / nkv, 1, dh))?
+            .contiguous()?
+            .reshape((b, h, 1, dh))?;
         let k = Tensor::cat(&[&cache_k, &ke], 2)?;
         let v = Tensor::cat(&[&cache_v, &ve], 2)?;
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? / (dh as f64).sqrt())?;
         let w = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        Ok(w.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, 1, h * dh))?)
+        Ok(w.matmul(&v)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, 1, h * dh))?)
     };
     let step_sdpa = || -> Result<Tensor> {
-        let ke = kn.unsqueeze(2)?.broadcast_as((b, nkv, h / nkv, 1, dh))?.contiguous()?.reshape((b, h, 1, dh))?;
-        let ve = vn.unsqueeze(2)?.broadcast_as((b, nkv, h / nkv, 1, dh))?.contiguous()?.reshape((b, h, 1, dh))?;
+        let ke = kn
+            .unsqueeze(2)?
+            .broadcast_as((b, nkv, h / nkv, 1, dh))?
+            .contiguous()?
+            .reshape((b, h, 1, dh))?;
+        let ve = vn
+            .unsqueeze(2)?
+            .broadcast_as((b, nkv, h / nkv, 1, dh))?
+            .contiguous()?
+            .reshape((b, h, 1, dh))?;
         let k = Tensor::cat(&[&cache_k, &ke], 2)?;
         let v = Tensor::cat(&[&cache_v, &ve], 2)?;
-        let o = candle_nn::ops::sdpa(&q, &k, &v, None, false, (1.0 / (dh as f64).sqrt()) as f32, 1.0)?;
+        let o = candle_nn::ops::sdpa(
+            &q,
+            &k,
+            &v,
+            None,
+            false,
+            (1.0 / (dh as f64).sqrt()) as f32,
+            1.0,
+        )?;
         Ok(o.transpose(1, 2)?.contiguous()?.reshape((b, 1, h * dh))?)
     };
     let bench = |label: &str, f: &dyn Fn() -> Result<Tensor>| -> Result<()> {
@@ -184,7 +246,10 @@ fn bench_bb_attn(dev: &Device, skv: usize, dt: DType) -> Result<()> {
             y = f()?;
         }
         sync(&y)?;
-        println!("  bb_attn skv={skv:<4} {label}: {:.4} ms/op", t0.elapsed().as_secs_f64() * 1000.0 / 1000.0);
+        println!(
+            "  bb_attn skv={skv:<4} {label}: {:.4} ms/op",
+            t0.elapsed().as_secs_f64() * 1000.0 / 1000.0
+        );
         Ok(())
     };
     bench("manual", &step)?;
@@ -201,7 +266,12 @@ fn bench_bb_attn(dev: &Device, skv: usize, dt: DType) -> Result<()> {
 fn bench_loop(dev: &Device, prompt_len: usize, n_frames: usize, dt: DType) -> Result<()> {
     use candle_core::D;
     let (b, h, nkv, dh, nl) = (2usize, 24usize, 8usize, 128usize, 28usize);
-    let mk = |s: usize| Tensor::randn(0f32, 1.0, (b, h, s, dh), dev).unwrap().to_dtype(dt).unwrap();
+    let mk = |s: usize| {
+        Tensor::randn(0f32, 1.0, (b, h, s, dh), dev)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+    };
     let mut ck: Vec<Tensor> = (0..nl).map(|_| mk(prompt_len)).collect();
     let mut cv: Vec<Tensor> = (0..nl).map(|_| mk(prompt_len)).collect();
     let q = Tensor::randn(0f32, 1.0, (b, h, 1, dh), dev)?.to_dtype(dt)?;
@@ -209,7 +279,10 @@ fn bench_loop(dev: &Device, prompt_len: usize, n_frames: usize, dt: DType) -> Re
     let vn = Tensor::randn(0f32, 1.0, (b, nkv, 1, dh), dev)?.to_dtype(dt)?;
     let expand = |x: &Tensor| -> Result<Tensor> {
         let (bb, nk, s, d) = x.dims4()?;
-        Ok(x.unsqueeze(2)?.broadcast_as((bb, nk, h / nkv, s, d))?.contiguous()?.reshape((bb, h, s, d))?)
+        Ok(x.unsqueeze(2)?
+            .broadcast_as((bb, nk, h / nkv, s, d))?
+            .contiguous()?
+            .reshape((bb, h, s, d))?)
     };
     let mut times = Vec::new();
     for _ in 0..n_frames {
@@ -226,21 +299,53 @@ fn bench_loop(dev: &Device, prompt_len: usize, n_frames: usize, dt: DType) -> Re
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     let warm: f64 = times[5..].iter().sum::<f64>() / (times.len() - 5) as f64;
-    println!("  loop prompt={prompt_len:<4} {dt:?}: {warm:.1} ms/frame (28 layers, growing-cat KV cache)");
+    println!(
+        "  loop prompt={prompt_len:<4} {dt:?}: {warm:.1} ms/frame (28 layers, growing-cat KV cache)"
+    );
     Ok(())
 }
 
 // 28 DISTINCT layers (~6 GB cold weights). `fused`+`twod` toggle the op-count optimizations.
 fn bench_cold_backbone(dev: &Device, dt: DType, fused: bool, twod: bool) -> Result<()> {
-    let mk = |a, b| Tensor::randn(0f32, 1.0, (a, b), dev).unwrap().to_dtype(dt).unwrap();
-    let mkn = || Tensor::randn(0f32, 1.0, (3072,), dev).unwrap().to_dtype(dt).unwrap();
-    struct L { wq: Tensor, wo: Tensor, w1: Tensor, w2: Tensor, w3: Tensor, n1: Tensor, n2: Tensor }
+    let mk = |a, b| {
+        Tensor::randn(0f32, 1.0, (a, b), dev)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+    };
+    let mkn = || {
+        Tensor::randn(0f32, 1.0, (3072,), dev)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+    };
+    struct L {
+        wq: Tensor,
+        wo: Tensor,
+        w1: Tensor,
+        w2: Tensor,
+        w3: Tensor,
+        n1: Tensor,
+        n2: Tensor,
+    }
     let layers: Vec<L> = (0..28)
-        .map(|_| L { wq: mk(3072, 3072), wo: mk(3072, 3072), w1: mk(3072, 8192), w2: mk(8192, 3072), w3: mk(3072, 8192), n1: mkn(), n2: mkn() })
+        .map(|_| L {
+            wq: mk(3072, 3072),
+            wo: mk(3072, 3072),
+            w1: mk(3072, 8192),
+            w2: mk(8192, 3072),
+            w3: mk(3072, 8192),
+            n1: mkn(),
+            n2: mkn(),
+        })
         .collect();
     let x0 = Tensor::randn(0f32, 1.0, (2, 1, 3072), dev)?.to_dtype(dt)?; // B=2, 1 token
     let norm = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
-        if fused { Ok(candle_nn::ops::rms_norm(&x.contiguous()?, w, 1e-5)?) } else { rmsnorm(x, w) }
+        if fused {
+            Ok(candle_nn::ops::rms_norm(&x.contiguous()?, w, 1e-5)?)
+        } else {
+            rmsnorm(x, w)
+        }
     };
     // matmul: 2D [B*S,D]@[D,N] (weight once) vs 3D broadcast (weight per batch)
     let mm = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
@@ -257,7 +362,10 @@ fn bench_cold_backbone(dev: &Device, dt: DType, fused: bool, twod: bool) -> Resu
         let a = mm(&mm(&h, &l.wq)?, &l.wo)?;
         let r = (x + a)?;
         let h2 = norm(&r, &l.n2)?;
-        let m = mm(&(candle_nn::ops::silu(&mm(&h2, &l.w1)?)? * mm(&h2, &l.w3)?)?, &l.w2)?;
+        let m = mm(
+            &(candle_nn::ops::silu(&mm(&h2, &l.w1)?)? * mm(&h2, &l.w3)?)?,
+            &l.w2,
+        )?;
         Ok((r + m)?)
     };
     let fwd = || -> Result<Tensor> {
@@ -276,7 +384,10 @@ fn bench_cold_backbone(dev: &Device, dt: DType, fused: bool, twod: bool) -> Resu
         y = fwd()?;
     }
     sync(&y)?;
-    println!("  cold_backbone fused={fused} twod={twod}: {:.1} ms/forward", t0.elapsed().as_secs_f64() * 1000.0 / 100.0);
+    println!(
+        "  cold_backbone fused={fused} twod={twod}: {:.1} ms/forward",
+        t0.elapsed().as_secs_f64() * 1000.0 / 100.0
+    );
     Ok(())
 }
 
@@ -299,14 +410,20 @@ fn main() -> Result<()> {
             y = x3.broadcast_matmul(&w)?;
         }
         sync(&y)?;
-        println!("  3D [2,1,3072]@[3072,3072] (broadcast): {:.4} ms/op", t.elapsed().as_secs_f64() * 1000.0 / 3000.0);
+        println!(
+            "  3D [2,1,3072]@[3072,3072] (broadcast): {:.4} ms/op",
+            t.elapsed().as_secs_f64() * 1000.0 / 3000.0
+        );
         let t = Instant::now();
         let mut y = x2.matmul(&w)?;
         for _ in 1..3000 {
             y = x2.matmul(&w)?;
         }
         sync(&y)?;
-        println!("  2D [2,3072]@[3072,3072]   (M=2)     : {:.4} ms/op", t.elapsed().as_secs_f64() * 1000.0 / 3000.0);
+        println!(
+            "  2D [2,3072]@[3072,3072]   (M=2)     : {:.4} ms/op",
+            t.elapsed().as_secs_f64() * 1000.0 / 3000.0
+        );
     }
     println!("--- COLD backbone (28 layers, B=2): op-count optimizations ---");
     bench_cold_backbone(&dev, DType::BF16, false, false)?; // baseline (hand rmsnorm, 3D matmul)
@@ -330,16 +447,22 @@ fn main() -> Result<()> {
     bench_layer(&dev, DType::F16, 1000)?;
     println!("--- elementwise/reduction ops: f32 vs bf16 (CPU-fallback hunt) ---");
     for dt in [DType::F32, DType::BF16] {
-        bench_named(&dev, "softmax", (1, 24, 1, 256), dt, 3000, |x| Ok(candle_nn::ops::softmax(x, D::Minus1)?))?;
+        bench_named(&dev, "softmax", (1, 24, 1, 256), dt, 3000, |x| {
+            Ok(candle_nn::ops::softmax(x, D::Minus1)?)
+        })?;
     }
     for dt in [DType::F32, DType::BF16] {
-        bench_named(&dev, "silu", (1, 1, 1, 8192), dt, 3000, |x| Ok(candle_nn::ops::silu(x)?))?;
+        bench_named(&dev, "silu", (1, 1, 1, 8192), dt, 3000, |x| {
+            Ok(candle_nn::ops::silu(x)?)
+        })?;
     }
     for dt in [DType::F32, DType::BF16] {
         bench_named(&dev, "add", (1, 1, 1, 3072), dt, 3000, |x| Ok((x + x)?))?;
     }
     for dt in [DType::F32, DType::BF16] {
-        bench_named(&dev, "to_f32", (1, 1, 1, 3072), dt, 3000, |x| Ok(x.to_dtype(DType::F32)?))?;
+        bench_named(&dev, "to_f32", (1, 1, 1, 3072), dt, 3000, |x| {
+            Ok(x.to_dtype(DType::F32)?)
+        })?;
     }
     println!("--- dtype comparison [1,3072]@[3072,3072] (the bf16 question) ---");
     bench_dtype(&dev, 1, 3072, 3072, 3000, DType::F32)?;

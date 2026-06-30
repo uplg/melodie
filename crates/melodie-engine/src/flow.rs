@@ -8,12 +8,12 @@
 //! Layout: the reference runs in (B,T,C); we keep (B,T,C) here and only drop to
 //! (B,C,T) inside the ProjectLayer convs.
 
-use candle_core::{Device, Tensor, D};
+use candle_core::{D, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Linear, Module};
 
+use crate::Result;
 use crate::codec::CodecWeights;
 use crate::config::{DitConfig, HeartCodecConfig};
-use crate::Result;
 
 // --- small helpers -------------------------------------------------------
 
@@ -40,7 +40,11 @@ struct Lin(Linear);
 impl Lin {
     fn load(w: &CodecWeights, prefix: &str, bias: bool) -> Result<Self> {
         let weight = w.tensor(&format!("{prefix}.weight"))?;
-        let b = if bias { Some(w.tensor(&format!("{prefix}.bias"))?) } else { None };
+        let b = if bias {
+            Some(w.tensor(&format!("{prefix}.bias"))?)
+        } else {
+            None
+        };
         Ok(Self(Linear::new(weight, b)))
     }
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
@@ -66,7 +70,10 @@ impl ProjectLayer {
     }
     fn fwd(&self, x_btc: &Tensor) -> Result<Tensor> {
         let xn = x_btc.transpose(1, 2)?.contiguous()?; // (B,C,T)
-        let cfg = Conv1dConfig { padding: self.kernel / 2, ..Default::default() };
+        let cfg = Conv1dConfig {
+            padding: self.kernel / 2,
+            ..Default::default()
+        };
         let y = Conv1d::new(self.conv_w.clone(), Some(self.conv_b.clone()), cfg).forward(&xn)?;
         let y = y.transpose(1, 2)?.contiguous()?; // (B,T,out)
         let y = (y * (self.kernel as f64).powf(-0.5))?;
@@ -164,7 +171,8 @@ impl Mlp {
         })
     }
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
-        self.down.fwd(&(silu(&self.gate.fwd(x)?)? * self.up.fwd(x)?)?)
+        self.down
+            .fwd(&(silu(&self.gate.fwd(x)?)? * self.up.fwd(x)?)?)
     }
 }
 
@@ -177,7 +185,13 @@ struct Block {
     dim: usize,
 }
 impl Block {
-    fn load(w: &CodecWeights, prefix: &str, n_heads: usize, head_dim: usize, dim: usize) -> Result<Self> {
+    fn load(
+        w: &CodecWeights,
+        prefix: &str,
+        n_heads: usize,
+        head_dim: usize,
+        dim: usize,
+    ) -> Result<Self> {
         Ok(Self {
             attn_norm: w.tensor(&format!("{prefix}.attn_norm.weight"))?,
             attn: Attn::load(w, &format!("{prefix}.attn"), n_heads, head_dim)?,
@@ -364,7 +378,9 @@ impl FlowMatching {
         let dit = Dit::load(w, &cfg.dit)?;
         let codebooks = (0..cfg.rvq.num_quantizers)
             .map(|q| {
-                let e = w.tensor(&format!("flow_matching.vq_embed.layers.{q}._codebook.embed"))?;
+                let e = w.tensor(&format!(
+                    "flow_matching.vq_embed.layers.{q}._codebook.embed"
+                ))?;
                 Ok(e.squeeze(0)?) // (1,S,D) -> (S,D)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -413,7 +429,9 @@ impl FlowMatching {
                 None => g,
             });
         }
-        let cond = self.cond_feature_emb.fwd(&self.project_out.fwd(&summed.unwrap())?)?; // (1,T,512)
+        let cond = self
+            .cond_feature_emb
+            .fwd(&self.project_out.fwd(&summed.unwrap())?)?; // (1,T,512)
         // Nearest-neighbour ×2 time upsample → conditioning `mu`.
         //
         // The reference builds `latent_masks` (=2 where frame<latent_length, else 0;
@@ -434,8 +452,11 @@ impl FlowMatching {
         // `latent_length == num_frames`, `incontext_length_actual == incontext_length`.
         let incontext_x = if incontext_length > 0 {
             let kept = true_latents.narrow(1, 0, incontext_length)?; // (1, ic, 256)
-            let zeros_rest =
-                Tensor::zeros((1, num_frames - incontext_length, 256), kept.dtype(), kept.device())?;
+            let zeros_rest = Tensor::zeros(
+                (1, num_frames - incontext_length, 256),
+                kept.dtype(),
+                kept.device(),
+            )?;
             Tensor::cat(&[&kept, &zeros_rest], 1)?
         } else {
             noise.zeros_like()? // all-zero context (1,2T,256)
@@ -513,9 +534,19 @@ impl FlowMatching {
     /// Returns fm_latents (1,2T,256). The seg0 path: all frames conditioned,
     /// `incontext_length=0`, CFG `gs` over `num_steps` Euler steps. Thin wrapper
     /// over [`Self::inference_codes`].
-    pub fn inference(&self, codes: &Tensor, noise: &Tensor, num_steps: usize, gs: f64) -> Result<Tensor> {
+    pub fn inference(
+        &self,
+        codes: &Tensor,
+        noise: &Tensor,
+        num_steps: usize,
+        gs: f64,
+    ) -> Result<Tensor> {
         let num_frames = noise.dim(1)?; // 2T
-        let ctx = SegmentCtx { true_latents: noise, latent_length: num_frames, incontext_length: 0 };
+        let ctx = SegmentCtx {
+            true_latents: noise,
+            latent_length: num_frames,
+            incontext_length: 0,
+        };
         self.inference_codes(codes, &ctx, noise, num_steps, gs)
     }
 }

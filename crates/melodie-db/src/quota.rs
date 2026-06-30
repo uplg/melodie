@@ -30,6 +30,21 @@ pub async fn try_increment(
     Ok(row.map(|(c,)| c as u32))
 }
 
+/// Undo a `try_increment` that turned out not to consume a real generation
+/// (e.g. the engine never picked up the job). No-ops if there's no row for
+/// today, or if the count is already 0.
+pub async fn decrement(pool: &SqlitePool, user_id: UserId) -> Result<(), DbError> {
+    let day_utc = Utc::now().format("%Y-%m-%d").to_string();
+    sqlx::query(
+        "UPDATE generation_quota SET count = MAX(count - 1, 0) WHERE user_id = ? AND day_utc = ?",
+    )
+    .bind(user_id.to_string())
+    .bind(&day_utc)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn count_today(pool: &SqlitePool, user_id: UserId) -> Result<u32, DbError> {
     let day_utc = Utc::now().format("%Y-%m-%d").to_string();
     let n: Option<(i64,)> =
@@ -85,4 +100,64 @@ pub async fn reset_all_today(pool: &SqlitePool) -> Result<u64, DbError> {
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert_user(pool: &SqlitePool, id: UserId) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, 'tester', 'x')",
+        )
+        .bind(id.to_string())
+        .bind(format!("{id}@test.invalid"))
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn try_increment_under_cap_succeeds(pool: SqlitePool) -> Result<(), DbError> {
+        let user = UserId::new();
+        insert_user(&pool, user).await?;
+        assert_eq!(try_increment(&pool, user, 4).await?, Some(1));
+        assert_eq!(try_increment(&pool, user, 4).await?, Some(2));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn try_increment_blocks_at_cap(pool: SqlitePool) -> Result<(), DbError> {
+        let user = UserId::new();
+        insert_user(&pool, user).await?;
+        assert_eq!(try_increment(&pool, user, 1).await?, Some(1));
+        assert_eq!(try_increment(&pool, user, 1).await?, None);
+        assert_eq!(count_today(&pool, user).await?, 1);
+        Ok(())
+    }
+
+    /// The bug this guards against: two requests racing the same (user, day)
+    /// row at cap=1 must not both be told they won — that would let a member
+    /// generate twice on a daily cap of one.
+    #[sqlx::test]
+    async fn try_increment_race_has_exactly_one_winner(pool: SqlitePool) -> Result<(), DbError> {
+        let user = UserId::new();
+        insert_user(&pool, user).await?;
+        let cap = 1;
+
+        let (a, b) = tokio::join!(
+            try_increment(&pool, user, cap),
+            try_increment(&pool, user, cap),
+        );
+        let winners = [a, b]
+            .into_iter()
+            .filter(|r| matches!(r, Ok(Some(_))))
+            .count();
+        assert_eq!(
+            winners, 1,
+            "exactly one concurrent increment should succeed at cap=1"
+        );
+        assert_eq!(count_today(&pool, user).await?, 1);
+        Ok(())
+    }
 }
