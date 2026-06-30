@@ -20,10 +20,12 @@
 
 pub mod codec;
 pub mod config;
+pub mod engine;
 pub mod error;
 pub mod flow;
 pub mod lm;
 pub mod parity;
 pub mod pipeline;
 
+pub use engine::{Audio, Engine, EngineConfig, GenOptions};
 pub use error::{EngineError, Result};

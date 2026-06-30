@@ -42,9 +42,9 @@ pub struct UpsertClip {
     pub image_url: Option<String>,
 }
 
-/// Upsert clips by `id`. Suno returns the same clip IDs across the initial
-/// `generate` response and subsequent `feed` polls, so we want to update
-/// status/duration/image as the generation progresses.
+/// Upsert clips by `id`. The same clip `id` is reused across the streaming
+/// placeholder insert and the worker's terminal update, so we update
+/// status/duration/image in place as the generation progresses.
 pub async fn upsert_many(pool: &SqlitePool, clips: &[UpsertClip]) -> Result<(), DbError> {
     if clips.is_empty() {
         return Ok(());

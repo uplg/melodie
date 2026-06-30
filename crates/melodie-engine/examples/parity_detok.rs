@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     let dev = Device::Cpu;
     let g = candle_core::safetensors::load(GOLDEN, &dev)?;
     let codes = g["dtk_codes"].unsqueeze(0)?; // (8,16) -> (1,8,16)
-    let fm_noise = &g["dtk_fm_noise"]; // (1,744,256)
+    let fm_noise = &g["dtk_fm_noise"]; // (1,186,256) — single 7.44 s segment
     let wav_g = &g["dtk_waveform"]; // (2, target)
 
     println!("loading codec...");
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     let codec = HeartCodec::load(&w, &HeartCodecConfig::default(), &dev)?;
 
     println!("detokenize (pad to segment + trim)...");
-    let wav = codec.detokenize(&codes, fm_noise, 7.44, 10, 1.25)?;
+    let wav = codec.detokenize(&codes, Some(fm_noise), 7.44, 10, 1.25)?;
     let d = max_abs_diff(&wav, wav_g)?;
     let rms = wav_g.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
     println!("waveform {:?} (golden {:?})  max|Δ|={d:.3e}  rms={rms:.3e}", wav.dims(), wav_g.dims());

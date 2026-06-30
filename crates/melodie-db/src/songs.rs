@@ -148,8 +148,8 @@ pub async fn set_status(
     Ok(())
 }
 
-/// Set the title only when the row currently has none. Used by the poll task
-/// to lift Suno-generated titles into describe-mode rows that started with
+/// Set the title only when the row currently has none. Useful for lifting an
+/// engine-derived title into describe-mode rows that started with
 /// `title = NULL`. Idempotent and cheap. Returns rows affected.
 pub async fn set_title_if_missing(
     pool: &SqlitePool,

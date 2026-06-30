@@ -16,6 +16,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
 
 use crate::config::HeartCodecConfig;
+use crate::flow::SegmentCtx;
 use crate::{EngineError, Result};
 
 // ---------------------------------------------------------------------------
@@ -142,6 +143,14 @@ fn flip_last_dim(w: &Tensor) -> Result<Tensor> {
     let idx: Vec<u32> = (0..k as u32).rev().collect();
     let idx = Tensor::from_vec(idx, k, w.device())?;
     Ok(w.index_select(&idx, 2)?)
+}
+
+/// Row vector `linspace(0, 1, n)` of shape `(1, n)` — the overlap-add crossfade
+/// window (`mx.linspace(0,1,ovlp)[None, :]` in modeling_heartcodec.py:175).
+fn linspace01_row(n: usize, dev: &Device) -> Result<Tensor> {
+    let denom = (n.max(2) - 1) as f32; // n>=2 in practice; guard n==1 against /0
+    let v: Vec<f32> = (0..n).map(|i| i as f32 / denom).collect();
+    Ok(Tensor::from_vec(v, (1, n), dev)?)
 }
 
 /// Nearest-neighbour ×2 upsample along the time axis (dim 2): repeat_interleave.
@@ -325,22 +334,153 @@ impl HeartCodec {
         self.scalar.decode(&latent) // (2, 2T*1920)
     }
 
-    /// Full detokenize for a clip shorter than one segment: pad codes to the
-    /// `duration`-second segment (≈372 frames), flow-match + ScalarModel decode,
-    /// then trim to the original length. Mirrors `HeartCodec.detokenize`
-    /// (modeling_heartcodec.py:96-223) for the single-segment case. `fm_noise` is
-    /// the injected `(1, 2*min_samples, 256)` latent noise.
-    pub fn detokenize(&self, codes: &Tensor, fm_noise: &Tensor, duration: f64, num_steps: usize, gs: f64) -> Result<Tensor> {
-        let t_orig = codes.dim(2)?;
-        let min_samples = (duration * 12.5) as usize;
-        let target_len = (t_orig as f64 / 12.5 * 48000.0) as usize;
-        // tile codes to min_samples (repeat-and-truncate)
-        let mut c = codes.clone();
-        while c.dim(2)? < min_samples {
-            c = Tensor::cat(&[&c, &c], 2)?;
+    /// Full multi-segment detokenize — port of `HeartCodec.detokenize`
+    /// (modeling_heartcodec.py:76-223). Pads codes to a whole number of
+    /// `duration`-second segments, flow-matches each segment (carrying the previous
+    /// segment's tail as in-context latents), ScalarModel-decodes, then linearly
+    /// crossfades the segments together (overlap-add) and trims to the original length.
+    ///
+    /// `codes` is `(1, Q, T)`. `fm_noise` (optional) injects the **first** segment's
+    /// initial latent `(1, 2*min_samples, 256)` for deterministic parity; when `None`
+    /// every segment's latent (and the in-context random pad) is drawn with `randn` —
+    /// matching the reference, which draws all randomness internally.
+    pub fn detokenize(
+        &self,
+        codes: &Tensor,
+        fm_noise: Option<&Tensor>,
+        duration: f64,
+        num_steps: usize,
+        gs: f64,
+    ) -> Result<Tensor> {
+        let dev = codes.device();
+
+        // --- segmentation constants (modeling_heartcodec.py:101-123) ---
+        let min_samples = (duration * 12.5) as usize; // codes/segment (372 @ 29.76)
+        let hop_samples = min_samples / 93 * 80; //                    (320)
+        let ovlp_samples = min_samples - hop_samples; // codes overlap (52)
+        let ovlp_frames = ovlp_samples * 2; // LATENT-frame overlap     (104)
+        let latent_length = (duration * 25.0) as usize; // latent frames/segment (744)
+        let sample_rate = 48000usize;
+
+        // target_len uses the ORIGINAL (pre-pad) code length.
+        let codes_len0 = codes.dim(2)?;
+        let target_len = (codes_len0 as f64 / 12.5 * sample_rate as f64) as usize;
+
+        // --- pad codes (modeling_heartcodec.py:108-122) ---
+        let mut codes = codes.clone();
+        if codes.dim(2)? < min_samples {
+            while codes.dim(2)? < min_samples {
+                codes = Tensor::cat(&[&codes, &codes], 2)?; // tile (concat to self)
+            }
+            codes = codes.narrow(2, 0, min_samples)?;
         }
-        let c = c.narrow(2, 0, min_samples)?;
-        let wav = self.detokenize_segment(&c, fm_noise, num_steps, gs)?; // (2, min_samples*2*1920)
-        Ok(wav.narrow(1, 0, target_len)?) // (2, target_len)
+        let codes_len = codes.dim(2)?;
+        // Reference `(codes_len - ovlp_frames) % hop_samples > 0` (codes not segment-aligned).
+        if !(codes_len - ovlp_frames).is_multiple_of(hop_samples) {
+            // NB: condition uses `ovlp_frames`, formula uses `ovlp_samples` (verbatim).
+            let len_codes = ((codes_len - ovlp_samples) as f64 / hop_samples as f64).ceil()
+                as usize
+                * hop_samples
+                + ovlp_samples;
+            while codes.dim(2)? < len_codes {
+                codes = Tensor::cat(&[&codes, &codes], 2)?;
+            }
+            codes = codes.narrow(2, 0, len_codes)?;
+        }
+        let total = codes.dim(2)?;
+
+        // --- segment loop (modeling_heartcodec.py:126-165) ---
+        // for sinx in range(0, total - hop_samples + 1, hop_samples)
+        let mut latent_list: Vec<Tensor> = Vec::new();
+        let mut sinx = 0usize;
+        while sinx + hop_samples <= total {
+            let codes_input = codes.narrow(2, sinx, min_samples)?; // (1,Q,min_samples)
+            let latents = if sinx == 0 || ovlp_frames == 0 {
+                // First segment: incontext_length = 0 (true_latents unused; the
+                // reference's `first_latent` randn only matters for its RNG draw).
+                let noise = match fm_noise {
+                    Some(n) if sinx == 0 => n.clone(),
+                    _ => Tensor::randn(0f32, 1f32, (1, 2 * min_samples, 256), dev)?,
+                };
+                let first_latent = Tensor::randn(0f32, 1f32, (1, latent_length, 256), dev)?;
+                let ctx = SegmentCtx {
+                    true_latents: &first_latent,
+                    latent_length,
+                    incontext_length: 0,
+                };
+                self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
+            } else {
+                // Subsequent segment: last `ovlp_frames` latents of the previous
+                // segment become the in-context prefix, padded with randn to length.
+                let prev = latent_list.last().unwrap();
+                let prev_t = prev.dim(1)?;
+                let true_tail = prev.narrow(1, prev_t - ovlp_frames, ovlp_frames)?; // (1,104,256)
+                let len_add = latent_length - ovlp_frames; // 640
+                let pad = Tensor::randn(0f32, 1f32, (1, len_add, 256), dev)?;
+                let true_latent = Tensor::cat(&[&true_tail, &pad], 1)?; // (1,744,256)
+                let noise = Tensor::randn(0f32, 1f32, (1, 2 * min_samples, 256), dev)?;
+                let ctx = SegmentCtx {
+                    true_latents: &true_latent,
+                    latent_length,
+                    incontext_length: ovlp_frames,
+                };
+                self.fm.inference_codes(&codes_input, &ctx, &noise, num_steps, gs)?
+            };
+            latent_list.push(latents);
+            sinx += hop_samples;
+        }
+        // first_latent_length == 0 ⇒ no prefix to strip from latent_list[0].
+
+        // --- audio overlap-add (modeling_heartcodec.py:167-223) ---
+        let min_samples_audio = (duration * sample_rate as f64) as usize; // 1428480
+        let hop_samples_audio = min_samples_audio / 93 * 80; //              1228800
+        let ovlp_samples_audio = min_samples_audio - hop_samples_audio; //    199680
+        let win = if ovlp_samples_audio > 0 {
+            Some(linspace01_row(ovlp_samples_audio, dev)?) // (1, ovlp)
+        } else {
+            None
+        };
+
+        let mut output: Option<Tensor> = None;
+        for latent in &latent_list {
+            // (B,T,256) → (B,T,2,128) → (B,2,T,128) → (2B,T,128)
+            let (b, t_lat, f_lat) = latent.dims3()?;
+            let latent_r = latent
+                .reshape((b, t_lat, 2, f_lat / 2))?
+                .permute((0, 2, 1, 3))?
+                .contiguous()?
+                .reshape((b * 2, t_lat, f_lat / 2))?;
+            let mut cur = self.scalar.decode(&latent_r)?; // (2, L)
+            if cur.dim(1)? > min_samples_audio {
+                cur = cur.narrow(1, 0, min_samples_audio)?;
+            }
+
+            output = Some(match output {
+                None => cur, // first segment
+                Some(prev) => {
+                    if ovlp_samples_audio == 0 {
+                        Tensor::cat(&[&prev, &cur], 1)?
+                    } else {
+                        let win = win.as_ref().unwrap();
+                        let win_inv = win.affine(-1.0, 1.0)?; // 1 - win
+                        let prev_len = prev.dim(1)?;
+                        let prev_head = prev.narrow(1, 0, prev_len - ovlp_samples_audio)?;
+                        let prev_tail =
+                            prev.narrow(1, prev_len - ovlp_samples_audio, ovlp_samples_audio)?;
+                        let cur_head = cur.narrow(1, 0, ovlp_samples_audio)?;
+                        let cur_rest =
+                            cur.narrow(1, ovlp_samples_audio, cur.dim(1)? - ovlp_samples_audio)?;
+                        // blended = prev_tail*(1-win) + cur_head*win
+                        let blended = (prev_tail.broadcast_mul(&win_inv)?
+                            + cur_head.broadcast_mul(win)?)?;
+                        Tensor::cat(&[&prev_head, &blended, &cur_rest], 1)?
+                    }
+                }
+            });
+        }
+
+        let output = output.unwrap();
+        let tl = target_len.min(output.dim(1)?);
+        Ok(output.narrow(1, 0, tl)?) // (2, target_len)
     }
 }

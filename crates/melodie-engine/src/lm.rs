@@ -146,21 +146,6 @@ fn build_rope_cache(dim: usize, max_seq: usize, base: f64, scale: f64, dev: &Dev
     Ok(Tensor::from_vec(data, (max_seq, half, 2), dev)?)
 }
 
-/// Apply RoPE to x `[B,S,H,D]` using `cache_sub` `[S,D/2,2]`.
-fn apply_rope(x: &Tensor, cache_sub: &Tensor) -> Result<Tensor> {
-    let (b, s, h, d) = x.dims4()?;
-    let half = d / 2;
-    let xr = x.reshape((b, s, h, half, 2))?;
-    let x0 = xr.narrow(4, 0, 1)?.squeeze(4)?;
-    let x1 = xr.narrow(4, 1, 1)?.squeeze(4)?;
-    let dt = x.dtype();
-    let cos = cache_sub.narrow(2, 0, 1)?.squeeze(2)?.reshape((1, s, 1, half))?.to_dtype(dt)?;
-    let sin = cache_sub.narrow(2, 1, 1)?.squeeze(2)?.reshape((1, s, 1, half))?.to_dtype(dt)?;
-    let out0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
-    let out1 = (x1.broadcast_mul(&cos)? + x0.broadcast_mul(&sin)?)?;
-    Ok(Tensor::stack(&[out0, out1], 4)?.reshape((b, s, h, d))?)
-}
-
 // --- attention (GQA) + KV cache -----------------------------------------
 
 #[derive(Default)]
@@ -401,6 +386,20 @@ fn sample_topk_gpu(logits: &Tensor, topk: usize, temperature: f64, uniform: &Ten
 }
 
 // --- HeartMuLa wrapper ---------------------------------------------------
+
+/// Sampling knobs for [`HeartMuLaLm::generate_codes`] (grouped so the call stays
+/// within clippy's argument-count limit).
+#[derive(Clone, Copy, Debug)]
+pub struct GenParams {
+    /// Classifier-free guidance scale (`>1.0` ⇒ cond+uncond batch).
+    pub cfg_scale: f64,
+    /// Hard cap on generated frames (12.5 Hz); generation also stops on EOS.
+    pub max_frames: usize,
+    /// Top-k sampling constraint.
+    pub topk: usize,
+    /// Sampling temperature.
+    pub temperature: f64,
+}
 
 pub struct HeartMuLaLm {
     backbone: Transformer,
@@ -714,7 +713,8 @@ impl HeartMuLaLm {
     /// Autoregressive multi-frame generation: prompt → codes `[ncb, T]`. Backbone
     /// KV cache persists across frames; each frame feeds the previous frame's audio
     /// tokens; stops at EOS (codebook-0 ≥ 8193) or `max_frames`. RNG is self-generated.
-    pub fn generate_codes(&self, tokens: &Tensor, mask: &Tensor, muq_idx: Option<usize>, cfg_scale: f64, max_frames: usize, topk: usize, temperature: f64) -> Result<Tensor> {
+    pub fn generate_codes(&self, tokens: &Tensor, mask: &Tensor, muq_idx: Option<usize>, params: &GenParams) -> Result<Tensor> {
+        let GenParams { cfg_scale, max_frames, topk, temperature } = *params;
         let dev = tokens.device();
         let ncb = self.cfg.audio_num_codebooks;
         let v = self.cfg.audio_vocab_size;
@@ -758,8 +758,8 @@ impl HeartMuLaLm {
 
         let gpu_sample = std::env::var("MELODIE_GPUSAMPLE").is_ok();
         let mut frames: Vec<Vec<u32>> = Vec::new();
-        let mut pos = s;
-        for _ in 0..max_frames {
+        // `pos` is the absolute KV position (starts past the `s`-token prompt).
+        for pos in s..s + max_frames {
             let tf = std::time::Instant::now();
             let uniforms = Tensor::rand(0f32, 1f32, (ncb, v), dev)?;
             let t0 = std::time::Instant::now();
@@ -806,7 +806,6 @@ impl HeartMuLaLm {
                 let minabs = v.iter().filter(|&&x| x != 0.0).fold(f32::INFINITY, |a, &x| a.min(x.abs()));
                 eprintln!("[dbg] last_h n={} maxabs={maxabs:.3e} minabs={minabs:.3e} nonfinite={bad} denorm={denorm}", v.len());
             }
-            pos += 1;
             nf += 1;
         }
         if prof && nf > 0 {

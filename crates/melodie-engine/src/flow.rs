@@ -330,6 +330,20 @@ fn upsample2_time_btc(x: &Tensor) -> Result<Tensor> {
     Ok(x.contiguous()?.reshape((b, t * 2, c))?)
 }
 
+/// In-context conditioning for one [`FlowMatching::inference_codes`] segment
+/// (groups the `true_latents` / `latent_length` / `incontext_length` args of the
+/// reference `flow_matching.py::inference_codes`).
+pub struct SegmentCtx<'a> {
+    /// Context latents `(1, latent_length, 256)`; only the first `incontext_length`
+    /// frames are read (the rest are masked to zero, matching `true_latents * mask`).
+    pub true_latents: &'a Tensor,
+    /// Valid latent frames for this segment (`== 2*T_codes` in this pipeline).
+    pub latent_length: usize,
+    /// Leading frames carried over as in-context (`0` ⇒ the in-context branch is inert
+    /// and `inference_codes` reduces exactly to the verified seg0 path).
+    pub incontext_length: usize,
+}
+
 /// FlowMatching: RVQ-conditioned flow-matching that turns codes → continuous latent.
 pub struct FlowMatching {
     dit: Dit,
@@ -355,14 +369,33 @@ impl FlowMatching {
         })
     }
 
-    /// `codes` (1,Q,T) integer codes, `noise` (1,2T,256) initial latent.
-    /// Returns fm_latents (1,2T,256). Matches the seg0 path (all frames conditioned,
-    /// incontext_length=0) with classifier-free guidance `gs` over `num_steps` Euler steps.
-    pub fn inference(&self, codes: &Tensor, noise: &Tensor, num_steps: usize, gs: f64) -> Result<Tensor> {
-        let dev = noise.device();
+    /// In-context-capable flow-matching inference — port of
+    /// `flow_matching.py::inference_codes` (161-252).
+    ///
+    /// - `codes` (1,Q,T_codes) integer codes for this segment.
+    /// - `ctx` the in-context conditioning ([`SegmentCtx`]): `true_latents`
+    ///   (1, latent_length, 256) — only the first `incontext_length` frames are read
+    ///   (the reference zeros the rest via the `mask==1` multiply).
+    /// - `noise` (1, 2*T_codes, 256) the initial latent. The reference draws this
+    ///   with `randn` *inside* `inference_codes`; we take it as an argument so the
+    ///   caller controls randomness (and parity tests can inject a fixed latent).
+    ///
+    /// Returns (1, 2*T_codes, 256). With `ctx.incontext_length == 0` the in-context
+    /// branch is inert and this reduces *exactly* to the verified seg0 path.
+    pub fn inference_codes(
+        &self,
+        codes: &Tensor,
+        ctx: &SegmentCtx,
+        noise: &Tensor,
+        num_steps: usize,
+        gs: f64,
+    ) -> Result<Tensor> {
+        let true_latents = ctx.true_latents;
+        let latent_length = ctx.latent_length;
+        let incontext_length = ctx.incontext_length;
         let t = codes.dim(2)?;
 
-        // RVQ codebook lookup + sum over quantizers, then project_out
+        // RVQ codebook lookup + sum over quantizers → project_out → cond_feature_emb.
         let codes_u = codes.to_dtype(candle_core::DType::U32)?;
         let mut summed: Option<Tensor> = None;
         for (q, emb) in self.codebooks.iter().enumerate() {
@@ -374,26 +407,108 @@ impl FlowMatching {
             });
         }
         let cond = self.cond_feature_emb.fwd(&self.project_out.fwd(&summed.unwrap())?)?; // (1,T,512)
+        // Nearest-neighbour ×2 time upsample → conditioning `mu`.
+        //
+        // The reference builds `latent_masks` (=2 where frame<latent_length, else 0;
+        // =1 where frame<incontext_length) and zeros `mu` wherever mask==0 (replacing
+        // it with `zero_cond_embedding1`, which is all zeros). In this pipeline
+        // `latent_length == num_frames == 2*T_codes` always, so the mask is 2 (or 1 in
+        // the in-context prefix) everywhere — never 0 — and the conditioning mask is the
+        // identity. `mu` is therefore used in full. (flow_matching.py:203-220)
         let mu = upsample2_time_btc(&cond)?; // (1,2T,512)
-        let mu_zeros = mu.zeros_like()?;
+        let num_frames = mu.dim(1)?;
+        debug_assert_eq!(
+            latent_length, num_frames,
+            "pipeline invariant: latent_length (=int(d*25)) == 2*T_codes (=2*int(d*12.5))"
+        );
 
-        // Euler ODE with CFG (incontext region is empty for seg0)
-        let mut x = noise.clone(); // (1,2T,256)
-        let ic = x.zeros_like()?;
+        // In-context latents = `true_latents * (latent_masks == 1)`: keep the first
+        // `incontext_length` frames, zero the rest (flow_matching.py:222-227). With
+        // `latent_length == num_frames`, `incontext_length_actual == incontext_length`.
+        let incontext_x = if incontext_length > 0 {
+            let kept = true_latents.narrow(1, 0, incontext_length)?; // (1, ic, 256)
+            let zeros_rest =
+                Tensor::zeros((1, num_frames - incontext_length, 256), kept.dtype(), kept.device())?;
+            Tensor::cat(&[&kept, &zeros_rest], 1)?
+        } else {
+            noise.zeros_like()? // all-zero context (1,2T,256)
+        };
+
+        // Euler ODE solve (with the per-step in-context blend), then restore the
+        // in-context prefix (flow_matching.py:233-250).
+        let solved = self.solve_euler(noise, &incontext_x, incontext_length, &mu, num_steps, gs)?;
+        if incontext_length > 0 {
+            let head = incontext_x.narrow(1, 0, incontext_length)?;
+            let tail = solved.narrow(1, incontext_length, num_frames - incontext_length)?;
+            Ok(Tensor::cat(&[&head, &tail], 1)?)
+        } else {
+            Ok(solved)
+        }
+    }
+
+    /// Fixed-step Euler ODE solver with classifier-free guidance and the optional
+    /// in-context blend — port of `flow_matching.py::_solve_euler` (254-312).
+    ///
+    /// `x_init` is the initial latent; it is also the `noise` reference the
+    /// in-context blend reads each step. `incontext_length == 0` skips the blend,
+    /// leaving the verified single-segment Euler/CFG body untouched.
+    fn solve_euler(
+        &self,
+        x_init: &Tensor,
+        incontext_x: &Tensor,
+        incontext_length: usize,
+        mu: &Tensor,
+        num_steps: usize,
+        gs: f64,
+    ) -> Result<Tensor> {
+        let dev = x_init.device();
+        let num_frames = x_init.dim(1)?;
+        let mu_zeros = mu.zeros_like()?;
+        let mut x = x_init.clone(); // (1,2T,256)
+        // t_span = linspace(0,1,num_steps+1) ⇒ uniform dt = 1/num_steps, t = step*dt.
         let dt = 1.0f64 / num_steps as f64;
         for step in 0..num_steps {
             let tval = step as f64 * dt;
-            let x2 = Tensor::cat(&[&x, &x], 0)?;
-            let ic2 = Tensor::cat(&[&ic, &ic], 0)?;
-            let mu2 = Tensor::cat(&[&mu_zeros, &mu], 0)?; // [uncond=zeros ; cond=mu]
-            let combined = Tensor::cat(&[&x2, &ic2, &mu2], 2)?; // (2,2T,1024)
-            let t_input = Tensor::from_vec(vec![tval as f32; 2], 2, dev)?;
-            let dphi = self.dit.forward(&combined, &t_input)?; // (2,2T,256)
-            let uncond = dphi.narrow(0, 0, 1)?;
-            let cond_d = dphi.narrow(0, 1, 1)?;
-            let guided = (&uncond + ((cond_d - &uncond)? * gs)?)?; // (1,2T,256)
-            x = (x + (guided * dt)?)?;
+
+            // In-context blend: x[:, :ic] = blend*noise[:, :ic] + t*incontext[:, :ic],
+            // blend = 1 - (1-1e-6)*t ; frames [ic:] are left as the current x.
+            if incontext_length > 0 {
+                let blend = 1.0 - (1.0 - 1e-6) * tval;
+                let head = ((x_init.narrow(1, 0, incontext_length)? * blend)?
+                    + (incontext_x.narrow(1, 0, incontext_length)? * tval)?)?;
+                let tail = x.narrow(1, incontext_length, num_frames - incontext_length)?;
+                x = Tensor::cat(&[&head, &tail], 1)?;
+            }
+
+            let dphi = if gs > 1.0 {
+                // Classifier-free guidance: batch [uncond(mu=0) ; cond(mu)].
+                let x2 = Tensor::cat(&[&x, &x], 0)?;
+                let ic2 = Tensor::cat(&[incontext_x, incontext_x], 0)?;
+                let mu2 = Tensor::cat(&[&mu_zeros, mu], 0)?; // [uncond=zeros ; cond=mu]
+                let combined = Tensor::cat(&[&x2, &ic2, &mu2], 2)?; // (2,2T,1024)
+                let t_input = Tensor::from_vec(vec![tval as f32; 2], 2, dev)?;
+                let dphi = self.dit.forward(&combined, &t_input)?; // (2,2T,256)
+                let uncond = dphi.narrow(0, 0, 1)?;
+                let cond_d = dphi.narrow(0, 1, 1)?;
+                (&uncond + ((cond_d - &uncond)? * gs)?)? // (1,2T,256)
+            } else {
+                let combined = Tensor::cat(&[&x, incontext_x, mu], 2)?; // (1,2T,1024)
+                let t_input = Tensor::from_vec(vec![tval as f32; 1], 1, dev)?;
+                self.dit.forward(&combined, &t_input)?
+            };
+
+            x = (x + (dphi * dt)?)?;
         }
         Ok(x)
+    }
+
+    /// `codes` (1,Q,T) integer codes, `noise` (1,2T,256) initial latent.
+    /// Returns fm_latents (1,2T,256). The seg0 path: all frames conditioned,
+    /// `incontext_length=0`, CFG `gs` over `num_steps` Euler steps. Thin wrapper
+    /// over [`Self::inference_codes`].
+    pub fn inference(&self, codes: &Tensor, noise: &Tensor, num_steps: usize, gs: f64) -> Result<Tensor> {
+        let num_frames = noise.dim(1)?; // 2T
+        let ctx = SegmentCtx { true_latents: noise, latent_length: num_frames, incontext_length: 0 };
+        self.inference_codes(codes, &ctx, noise, num_steps, gs)
     }
 }

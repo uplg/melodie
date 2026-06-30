@@ -15,15 +15,17 @@ use melodie_core::model::{Song, SongMode, SongStatus};
 use melodie_db::clips::UpsertClip;
 use melodie_db::songs::NewSong;
 use serde::{Deserialize, Serialize};
-use suno_client::SunoError;
-use suno_client::types::{ControlSliders, GenerateRequest};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::events::SongEvent;
 use crate::extract::AuthUser;
-use crate::poll::SongEvent;
 use crate::state::AppState;
+
+/// Model identifier recorded on every song row. The local HeartMuLa engine is
+/// the only generator now, so this is a constant.
+const ENGINE_MODEL: &str = "heartmula";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -39,7 +41,7 @@ pub fn router() -> Router<AppState> {
 
 pub const DAILY_CAP: u32 = 4;
 
-// --- field caps (mirror Suno's documented limits) ---
+// --- field caps ---
 
 const TITLE_MAX: usize = 100;
 const TAGS_MAX: usize = 1000;
@@ -51,7 +53,7 @@ const PROMPT_MAX: usize = 500;
 
 /// Body shape for `POST /api/songs`. Tagged-union by `mode`:
 /// - `{ "mode": "custom",   ... }` — full lyrics + tags + sliders.
-/// - `{ "mode": "describe", ... }` — single free-text prompt; Suno authors lyrics.
+/// - `{ "mode": "describe", ... }` — single free-text prompt used as lyrics.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum CreateSongRequest {
@@ -74,19 +76,11 @@ pub struct CustomFields {
     pub style_influence: Option<i32>,
     #[serde(default)]
     pub variation: Option<String>,
-    #[serde(default)]
-    pub instrumental: bool,
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DescribeFields {
     pub prompt: String,
-    #[serde(default)]
-    pub instrumental: bool,
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,19 +156,7 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<SongView>)> {
     validate_create(&req)?;
 
-    // --- shared preamble (auth / quota / captcha) ---
-
-    // Pull the active Suno client first — a 503 here shouldn't burn the
-    // user's daily quota slot.
-    let client = state
-        .suno
-        .current()
-        .await
-        .ok_or_else(|| ApiError::Suno(SunoError::AuthMissing))?;
-
-    // Quota check (admin bypass). If Suno or captcha fails *after* this point
-    // the slot is consumed; accepted — the friends-project scope doesn't
-    // justify a compensating-rollback path.
+    // Quota check (admin bypass).
     if user.role != melodie_core::model::Role::Admin {
         let new_count = melodie_db::quota::try_increment(&state.db, user.id, DAILY_CAP).await?;
         if new_count.is_none() {
@@ -182,42 +164,10 @@ async fn create(
         }
     }
 
-    // Solve hCaptcha. Boots Chrome on first call (~10s) and reuses it across
-    // subsequent solves. Required for both modes — Suno's v2-web endpoint
-    // gates everything.
-    let auth = client.auth_snapshot();
-    let captcha_token = suno_client::captcha::solve(&auth).await?;
-
-    // --- mode-specific: build the upstream request + DB row ---
-
-    let (sreq, song_id, model_key) = match &req {
+    // Create the song row (`songs::create` inserts it with `status =
+    // 'generating'`) and pull out the lyrics/tags the engine should sing.
+    let (song_id, lyrics, tags) = match &req {
         CreateSongRequest::Custom(c) => {
-            let model_key = c
-                .model
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("chirp-fenix")
-                .to_string();
-
-            let mut sreq = GenerateRequest::new(&model_key, "custom");
-            sreq.token = Some(captcha_token);
-            sreq.title = Some(c.title.trim().to_string());
-            sreq.tags = Some(c.tags.trim().to_string());
-            sreq.negative_tags = c
-                .exclude_tags
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            sreq.prompt = c.lyrics.trim().to_string();
-            sreq.make_instrumental = c.instrumental;
-            if c.weirdness.is_some() || c.style_influence.is_some() {
-                sreq.metadata.control_sliders = Some(ControlSliders {
-                    weirdness_constraint: c.weirdness.map(|v| f64::from(v) / 100.0),
-                    style_weight: c.style_influence.map(|v| f64::from(v) / 100.0),
-                });
-            }
-
             let song_id = melodie_db::songs::create(
                 &state.db,
                 NewSong {
@@ -232,38 +182,13 @@ async fn create(
                     weirdness: c.weirdness,
                     style_inf: c.style_influence,
                     variation: c.variation.as_deref(),
-                    model: &model_key,
+                    model: ENGINE_MODEL,
                 },
             )
             .await?;
-
-            (sreq, song_id, model_key)
+            (song_id, c.lyrics.trim().to_string(), c.tags.trim().to_string())
         }
         CreateSongRequest::Describe(d) => {
-            let model_key = d
-                .model
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("chirp-fenix")
-                .to_string();
-
-            // Suno's "Simple" / description mode wire shape (per upstream
-            // `API_INTELLIGENCE.md`):
-            //   - `gpt_description_prompt`: the user's free-text description
-            //   - `prompt`: empty string (NOT the description)
-            //   - `title` / `tags`: empty strings (Suno authors them)
-            //   - `metadata.create_mode`: "inspiration"
-            //
-            // Earlier we put the user text into `prompt` and Suno dutifully
-            // sang it back as lyrics. The fix is `gpt_description_prompt`.
-            let mut sreq = GenerateRequest::new(&model_key, "inspiration");
-            sreq.token = Some(captcha_token);
-            sreq.title = Some(String::new());
-            sreq.tags = Some(String::new());
-            sreq.prompt = String::new();
-            sreq.gpt_description_prompt = Some(d.prompt.trim().to_string());
-            sreq.make_instrumental = d.instrumental;
-
             let song_id = melodie_db::songs::create(
                 &state.db,
                 NewSong {
@@ -278,64 +203,41 @@ async fn create(
                     weirdness: None,
                     style_inf: None,
                     variation: None,
-                    model: &model_key,
+                    model: ENGINE_MODEL,
                 },
             )
             .await?;
-
-            (sreq, song_id, model_key)
+            (song_id, d.prompt.trim().to_string(), String::new())
         }
     };
 
-    // --- shared tail: submit, persist clips, spawn poller, return view ---
-
-    let _ = model_key; // model_key is captured into the DB row above; silence unused-binding lint
-
-    let suno_clips = match client.generate(&sreq).await {
-        Ok(clips) => clips,
-        Err(e) => {
-            // Generation failed; mark the song as failed so the user sees it
-            // in the list rather than a phantom "generating" stuck forever.
-            let _ = melodie_db::songs::set_status(
-                &state.db,
-                song_id,
-                SongStatus::Failed,
-                Some(&e.to_string()),
-            )
-            .await;
-            return Err(ApiError::from(e));
-        }
-    };
-
-    if suno_clips.is_empty() {
-        let _ = melodie_db::songs::set_status(
-            &state.db,
+    // One streaming clip up front so the UI has a row to follow; the worker
+    // flips it to complete/error when the generation finishes.
+    let clip_id = Uuid::new_v4().to_string();
+    melodie_db::clips::upsert_many(
+        &state.db,
+        &[UpsertClip {
+            id: clip_id.clone(),
             song_id,
-            SongStatus::Failed,
-            Some("Suno returned 0 clips"),
-        )
-        .await;
-        return Err(ApiError::Internal(
-            "Suno returned 0 clips for a successful generate".into(),
-        ));
+            variant_index: 0,
+            status: "streaming".into(),
+            duration_s: None,
+            image_url: None,
+        }],
+    )
+    .await?;
+
+    // Hand the work to the engine worker thread, which drives the clip/song
+    // updates and the SSE broadcast itself.
+    if let Err(e) = state.engine.send(crate::engine::EngineJob {
+        song_id,
+        clip_id,
+        lyrics,
+        tags,
+        max_frames: 2250,
+    }) {
+        tracing::error!(error = %e, %song_id, "engine: failed to enqueue job");
     }
-
-    let upserts: Vec<UpsertClip> = suno_clips
-        .iter()
-        .enumerate()
-        .map(|(i, c)| UpsertClip {
-            id: c.id.clone(),
-            song_id,
-            variant_index: i as i32,
-            status: c.status.clone(),
-            duration_s: c.metadata.duration,
-            image_url: c.image_url.clone(),
-        })
-        .collect();
-    melodie_db::clips::upsert_many(&state.db, &upserts).await?;
-
-    let clip_ids: Vec<String> = suno_clips.iter().map(|c| c.id.clone()).collect();
-    crate::poll::spawn(state.clone(), song_id, clip_ids);
 
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
@@ -510,18 +412,6 @@ async fn delete_song(
         },
     ) {
         return Err(ApiError::Forbidden);
-    }
-
-    // Best-effort upstream trash. We log on failure and still delete locally —
-    // the user's intent is to remove the song from their view, not to keep
-    // garbage in our DB if Suno is down.
-    if let Some(client) = state.suno.current().await {
-        let clip_ids: Vec<String> = song.clips.iter().map(|c| c.id.clone()).collect();
-        if !clip_ids.is_empty()
-            && let Err(e) = client.delete_clips(&clip_ids).await
-        {
-            tracing::warn!(error = %e, song_id = %song_id, "suno delete_clips failed, deleting locally anyway");
-        }
     }
 
     melodie_db::songs::delete(&state.db, song_id).await?;

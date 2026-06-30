@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/suno-client",
     "crates/melodie-core",
     "crates/melodie-db",
     "crates/melodie-api",

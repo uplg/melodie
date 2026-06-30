@@ -52,9 +52,9 @@ pub struct Song {
     pub clips: Vec<Clip>,
 }
 
-/// `status` is the raw Suno status string (`submitted` | `queued` | `streaming`
-/// | `complete` | `error`). We keep it as a string rather than an enum so the
-/// upstream is free to add new states without breaking deserialization.
+/// `status` is the raw clip status string (`streaming` | `complete` | `error`).
+/// We keep it as a string rather than an enum so the set of states can grow
+/// without breaking deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Clip {
     pub id: String,
