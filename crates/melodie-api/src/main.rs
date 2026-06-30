@@ -1,20 +1,15 @@
-use std::sync::Arc;
-
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap;
 mod config;
+mod engine;
 mod error;
+mod events;
 mod extract;
-mod health;
-mod notifier;
-mod poll;
-mod preflight;
 mod resume;
 mod router;
 mod routes;
 mod state;
-mod suno;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,10 +22,6 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::AppConfig::from_env()?;
     let pool = melodie_db::connect_and_migrate(&cfg.database_url).await?;
     bootstrap::ensure_bootstrap_invite(&pool, cfg.bootstrap_invite.as_deref()).await?;
-    preflight::check_chrome();
-
-    let suno_bridge = Arc::new(suno::SunoBridge::from_db(pool.clone()).await);
-    let notifier = notifier::from_env();
 
     // Single-publisher shutdown signal that fans out to background tasks.
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -38,19 +29,13 @@ async fn main() -> anyhow::Result<()> {
     // Capacity: at low volume (handful of friends, ~10 concurrent generations)
     // 64 is plenty. Lagged subscribers drop frames silently and re-sync on
     // the next tick anyway.
-    let (events_tx, _) = tokio::sync::broadcast::channel::<poll::SongEvent>(64);
+    let (events_tx, _) = tokio::sync::broadcast::channel::<events::SongEvent>(64);
 
-    let _health_task = health::spawn(
-        suno_bridge.clone(),
-        notifier.clone(),
-        pool.clone(),
-        shutdown_tx.subscribe(),
-    );
+    // Any song still "generating" was dropped when the previous process died —
+    // the worker queue isn't persisted, so bury those rows up front.
+    resume::resume_in_flight(pool.clone()).await;
 
-    // Pick up songs whose poll loop died with the previous process.
-    resume::resume_in_flight(pool.clone(), suno_bridge.clone(), events_tx.clone()).await;
-
-    let app = router::build(&cfg, pool, suno_bridge, events_tx).await?;
+    let app = router::build(&cfg, pool, events_tx).await?;
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, "melodie-api listening");
 

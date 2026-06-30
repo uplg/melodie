@@ -2,13 +2,13 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use melodie_core::ids::UserId;
 use melodie_core::model::Role;
 use melodie_db::invites::InviteListRow;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,52 +19,10 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/admin/suno-auth", post(set_suno_auth))
-        .route("/admin/health", get(get_health))
         .route("/admin/invites", get(list_invites).post(create_invite))
         .route("/admin/songs", get(list_all_songs))
         .route("/admin/quotas", get(list_quotas).delete(reset_all_quotas))
         .route("/admin/quotas/{user_id}", axum::routing::delete(reset_user_quota))
-}
-
-#[derive(Debug, Deserialize)]
-struct SunoAuthRequest {
-    clerk_cookie: String,
-}
-
-async fn set_suno_auth(
-    State(state): State<AppState>,
-    _admin: AdminUser,
-    Json(req): Json<SunoAuthRequest>,
-) -> ApiResult<StatusCode> {
-    if req.clerk_cookie.trim().is_empty() {
-        return Err(ApiError::BadRequest("clerk_cookie must not be empty".into()));
-    }
-    state.suno.replace_auth(req.clerk_cookie).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Serialize)]
-struct HealthView {
-    status: String,
-    last_check: Option<String>,
-    has_jwt: bool,
-    has_clerk_cookie: bool,
-}
-
-async fn get_health(
-    State(state): State<AppState>,
-    _admin: AdminUser,
-) -> ApiResult<Json<HealthView>> {
-    let row = melodie_db::suno_session::load(&state.db)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(HealthView {
-        status: row.last_status,
-        last_check: row.last_check,
-        has_jwt: row.jwt.is_some(),
-        has_clerk_cookie: row.clerk_cookie.is_some(),
-    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -146,12 +104,11 @@ struct AdminSongOwner {
 struct AdminSongView {
     id: String,
     owner: AdminSongOwner,
-    mode: String,
     title: Option<String>,
     tags: Option<String>,
-    exclude_tags: Option<String>,
     lyrics: Option<String>,
     prompt: Option<String>,
+    language: String,
     model: String,
     status: String,
     error: Option<String>,
@@ -184,15 +141,11 @@ async fn list_all_songs(
                 id: song.owner_id.to_string(),
                 display_name: owner_display_name,
             },
-            mode: match song.mode {
-                melodie_core::model::SongMode::Custom => "custom".into(),
-                melodie_core::model::SongMode::Describe => "describe".into(),
-            },
             title: song.title,
             tags: song.tags,
-            exclude_tags: song.exclude_tags,
             lyrics: song.lyrics,
             prompt: song.prompt,
+            language: song.language,
             model: song.model,
             status: match song.status {
                 melodie_core::model::SongStatus::Pending => "pending".into(),

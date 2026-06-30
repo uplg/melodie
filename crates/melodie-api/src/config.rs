@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -10,6 +11,18 @@ pub struct AppConfig {
     /// token are set, the `POST /api/clips/{id}/push-to-live` endpoint is
     /// enabled and the UI shows a "Push to live" button on each clip.
     pub homie_push: Option<HomiePushConfig>,
+    /// Local HeartMuLa engine settings. `POST /api/songs` always generates
+    /// on-device through this engine.
+    pub engine: EngineSettings,
+}
+
+/// Configuration for the local `melodie-engine` generator.
+#[derive(Debug, Clone)]
+pub struct EngineSettings {
+    /// Checkpoint locations handed to `Engine::load`.
+    pub engine_cfg: melodie_engine::EngineConfig,
+    /// Directory where generated `.mp3` files are written and served from.
+    pub audio_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -39,13 +52,37 @@ impl AppConfig {
 
         let homie_push = HomiePushConfig::from_env();
 
+        let engine = EngineSettings::from_env();
+
         Ok(Self {
             bind,
             database_url,
             bootstrap_invite,
             cookie_secure,
             homie_push,
+            engine,
         })
+    }
+}
+
+impl EngineSettings {
+    fn from_env() -> Self {
+        let lm_dir = std::env::var("MELODIE_LM_DIR")
+            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/HeartMuLa-oss-3B".into());
+        let codec_dir = std::env::var("MELODIE_CODEC_DIR")
+            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss".into());
+        let tokenizer = std::env::var("MELODIE_TOKENIZER")
+            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/tokenizer.json".into());
+        let audio_dir = std::env::var("MELODIE_AUDIO_DIR").unwrap_or_else(|_| "data/audio".into());
+
+        Self {
+            engine_cfg: melodie_engine::EngineConfig {
+                lm_dir: PathBuf::from(lm_dir),
+                codec_dir: PathBuf::from(codec_dir),
+                tokenizer_path: PathBuf::from(tokenizer),
+            },
+            audio_dir: PathBuf::from(audio_dir),
+        }
     }
 }
 

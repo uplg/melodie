@@ -12,7 +12,6 @@ pub mod club;
 pub mod invites;
 pub mod quota;
 pub mod songs;
-pub mod suno_session;
 pub mod users;
 
 #[derive(Debug, thiserror::Error)]

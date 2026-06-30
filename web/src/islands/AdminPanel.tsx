@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   createInvite,
-  fetchHealth,
   fetchInvites,
   fetchQuotas,
   resetAllQuotas,
   resetUserQuota,
-  setSunoCookie,
-  type Health,
   type Invite,
   type QuotaRow,
 } from '../lib/api';
@@ -15,122 +12,9 @@ import {
 export default function AdminPanel() {
   return (
     <div className="space-y-6">
-      <SunoSection />
       <QuotasSection />
       <InvitesSection />
     </div>
-  );
-}
-
-function SunoSection() {
-  const [health, setHealth] = useState<Health | null>(null);
-  const [healthError, setHealthError] = useState<string | null>(null);
-  const [cookie, setCookie] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  const [submitOk, setSubmitOk] = useState(false);
-
-  const refresh = useCallback(() => {
-    fetchHealth()
-      .then((h) => {
-        setHealth(h);
-        setHealthError(null);
-      })
-      .catch((e: unknown) => {
-        setHealthError(e instanceof Error ? e.message : 'Failed to load health');
-      });
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 30_000);
-    return () => clearInterval(id);
-  }, [refresh]);
-
-  const onSubmit = async (e: React.SubmitEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!cookie.trim()) return;
-    setSubmitting(true);
-    setSubmitError(null);
-    setSubmitOk(false);
-    try {
-      await setSunoCookie(cookie.trim());
-      setSubmitOk(true);
-      setCookie('');
-      refresh();
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : 'Submission failed');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <section className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 space-y-4">
-      <header>
-        <h2 className="text-lg font-semibold tracking-tight">Suno session</h2>
-        <p className="mt-1 text-sm text-neutral-500">
-          One Clerk cookie is shared across every Melodie user. Re-up here when the
-          health-check loop pings you on Telegram.
-        </p>
-      </header>
-
-      <div className="rounded-md border border-neutral-200 dark:border-neutral-800 px-4 py-3 text-sm">
-        {healthError ? (
-          <span className="text-red-600 dark:text-red-400">{healthError}</span>
-        ) : !health ? (
-          <span className="text-neutral-500">Loading…</span>
-        ) : (
-          <div className="grid grid-cols-2 gap-2">
-            <Cell label="Status">
-              <HealthBadge status={health.status} />
-            </Cell>
-            <Cell label="Last check">
-              {health.last_check
-                ? new Date(health.last_check).toLocaleString()
-                : '—'}
-            </Cell>
-            <Cell label="JWT in DB">{health.has_jwt ? 'yes' : 'no'}</Cell>
-            <Cell label="Clerk cookie in DB">
-              {health.has_clerk_cookie ? 'yes' : 'no'}
-            </Cell>
-          </div>
-        )}
-      </div>
-
-      <form onSubmit={onSubmit} className="space-y-3">
-        <label className="block">
-          <span className="text-sm font-medium">New Clerk cookie</span>
-          <textarea
-            value={cookie}
-            onChange={(e) => setCookie(e.target.value)}
-            rows={3}
-            placeholder="Paste the __client cookie value from auth.suno.com"
-            className="mt-1 w-full rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-950 px-3 py-2 text-sm font-mono"
-          />
-        </label>
-        {submitError && (
-          <p
-            role="alert"
-            className="rounded-md border border-red-300 bg-red-50 dark:border-red-900 dark:bg-red-950/40 px-3 py-2 text-sm text-red-700 dark:text-red-300"
-          >
-            {submitError}
-          </p>
-        )}
-        {submitOk && (
-          <p className="rounded-md border border-emerald-300 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/40 px-3 py-2 text-sm text-emerald-800 dark:text-emerald-300">
-            Suno session updated.
-          </p>
-        )}
-        <button
-          type="submit"
-          disabled={submitting || !cookie.trim()}
-          className="rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-4 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-50"
-        >
-          {submitting ? 'Submitting…' : 'Submit cookie'}
-        </button>
-      </form>
-    </section>
   );
 }
 
@@ -381,31 +265,6 @@ function InvitesSection() {
         </div>
       )}
     </section>
-  );
-}
-
-function Cell({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="text-xs uppercase text-neutral-500">{label}</div>
-      <div className="mt-0.5">{children}</div>
-    </div>
-  );
-}
-
-function HealthBadge({ status }: { status: string }) {
-  const tone =
-    status === 'ok'
-      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
-      : status === 'expired'
-        ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
-        : status === 'missing'
-          ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
-          : 'bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300';
-  return (
-    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${tone}`}>
-      {status}
-    </span>
   );
 }
 

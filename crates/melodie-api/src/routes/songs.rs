@@ -11,18 +11,16 @@ use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use melodie_core::authz::{self, Action, Resource};
 use melodie_core::ids::SongId;
-use melodie_core::model::{Song, SongMode, SongStatus};
+use melodie_core::model::{Song, SongStatus};
 use melodie_db::clips::UpsertClip;
 use melodie_db::songs::NewSong;
 use serde::{Deserialize, Serialize};
-use suno_client::SunoError;
-use suno_client::types::{ControlSliders, GenerateRequest};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::events::SongEvent;
 use crate::extract::AuthUser;
-use crate::poll::SongEvent;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -39,65 +37,34 @@ pub fn router() -> Router<AppState> {
 
 pub const DAILY_CAP: u32 = 4;
 
-// --- field caps (mirror Suno's documented limits) ---
+// --- field caps ---
 
 const TITLE_MAX: usize = 100;
 const TAGS_MAX: usize = 1000;
-const EXCLUDE_MAX: usize = 1000;
 const LYRICS_MAX: usize = 5000;
-const PROMPT_MAX: usize = 500;
 
 // --- request / response views ---
 
-/// Body shape for `POST /api/songs`. Tagged-union by `mode`:
-/// - `{ "mode": "custom",   ... }` — full lyrics + tags + sliders.
-/// - `{ "mode": "describe", ... }` — single free-text prompt; Suno authors lyrics.
+/// Body shape for `POST /api/songs`. The local HeartMuLa engine's only
+/// generation inputs are `lyrics`, `styles` (short comma-separated genre/mood
+/// tags the user calls "tags") and `language`; `model` records the generator
+/// on the row.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum CreateSongRequest {
-    Custom(CustomFields),
-    Describe(DescribeFields),
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CustomFields {
-    pub title: String,
-    pub tags: String,
-    #[serde(default)]
-    pub exclude_tags: Option<String>,
+pub struct CreateSongRequest {
     pub lyrics: String,
-    #[serde(default)]
-    pub vocal: Option<String>,
-    #[serde(default)]
-    pub weirdness: Option<i32>,
-    #[serde(default)]
-    pub style_influence: Option<i32>,
-    #[serde(default)]
-    pub variation: Option<String>,
-    #[serde(default)]
-    pub instrumental: bool,
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DescribeFields {
-    pub prompt: String,
-    #[serde(default)]
-    pub instrumental: bool,
-    #[serde(default)]
-    pub model: Option<String>,
+    pub styles: String,
+    pub language: String,
+    pub model: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SongView {
     pub id: String,
-    pub mode: String,
     pub title: Option<String>,
     pub tags: Option<String>,
-    pub exclude_tags: Option<String>,
     pub lyrics: Option<String>,
     pub prompt: Option<String>,
+    pub language: String,
     pub model: String,
     pub status: String,
     pub error: Option<String>,
@@ -119,15 +86,11 @@ impl From<&Song> for SongView {
     fn from(s: &Song) -> Self {
         Self {
             id: s.id.to_string(),
-            mode: match s.mode {
-                SongMode::Custom => "custom".into(),
-                SongMode::Describe => "describe".into(),
-            },
             title: s.title.clone(),
             tags: s.tags.clone(),
-            exclude_tags: s.exclude_tags.clone(),
             lyrics: s.lyrics.clone(),
             prompt: s.prompt.clone(),
+            language: s.language.clone(),
             model: s.model.clone(),
             status: match s.status {
                 SongStatus::Pending => "pending".into(),
@@ -162,19 +125,7 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<SongView>)> {
     validate_create(&req)?;
 
-    // --- shared preamble (auth / quota / captcha) ---
-
-    // Pull the active Suno client first — a 503 here shouldn't burn the
-    // user's daily quota slot.
-    let client = state
-        .suno
-        .current()
-        .await
-        .ok_or_else(|| ApiError::Suno(SunoError::AuthMissing))?;
-
-    // Quota check (admin bypass). If Suno or captcha fails *after* this point
-    // the slot is consumed; accepted — the friends-project scope doesn't
-    // justify a compensating-rollback path.
+    // Quota check (admin bypass).
     if user.role != melodie_core::model::Role::Admin {
         let new_count = melodie_db::quota::try_increment(&state.db, user.id, DAILY_CAP).await?;
         if new_count.is_none() {
@@ -182,160 +133,69 @@ async fn create(
         }
     }
 
-    // Solve hCaptcha. Boots Chrome on first call (~10s) and reuses it across
-    // subsequent solves. Required for both modes — Suno's v2-web endpoint
-    // gates everything.
-    let auth = client.auth_snapshot();
-    let captcha_token = suno_client::captcha::solve(&auth).await?;
-
-    // --- mode-specific: build the upstream request + DB row ---
-
-    let (sreq, song_id, model_key) = match &req {
-        CreateSongRequest::Custom(c) => {
-            let model_key = c
-                .model
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("chirp-fenix")
-                .to_string();
-
-            let mut sreq = GenerateRequest::new(&model_key, "custom");
-            sreq.token = Some(captcha_token);
-            sreq.title = Some(c.title.trim().to_string());
-            sreq.tags = Some(c.tags.trim().to_string());
-            sreq.negative_tags = c
-                .exclude_tags
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            sreq.prompt = c.lyrics.trim().to_string();
-            sreq.make_instrumental = c.instrumental;
-            if c.weirdness.is_some() || c.style_influence.is_some() {
-                sreq.metadata.control_sliders = Some(ControlSliders {
-                    weirdness_constraint: c.weirdness.map(|v| f64::from(v) / 100.0),
-                    style_weight: c.style_influence.map(|v| f64::from(v) / 100.0),
-                });
-            }
-
-            let song_id = melodie_db::songs::create(
-                &state.db,
-                NewSong {
-                    owner_id: user.id,
-                    mode: SongMode::Custom,
-                    title: Some(&c.title),
-                    tags: Some(&c.tags),
-                    exclude_tags: c.exclude_tags.as_deref(),
-                    lyrics: Some(&c.lyrics),
-                    prompt: None,
-                    vocal: c.vocal.as_deref(),
-                    weirdness: c.weirdness,
-                    style_inf: c.style_influence,
-                    variation: c.variation.as_deref(),
-                    model: &model_key,
-                },
-            )
-            .await?;
-
-            (sreq, song_id, model_key)
-        }
-        CreateSongRequest::Describe(d) => {
-            let model_key = d
-                .model
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("chirp-fenix")
-                .to_string();
-
-            // Suno's "Simple" / description mode wire shape (per upstream
-            // `API_INTELLIGENCE.md`):
-            //   - `gpt_description_prompt`: the user's free-text description
-            //   - `prompt`: empty string (NOT the description)
-            //   - `title` / `tags`: empty strings (Suno authors them)
-            //   - `metadata.create_mode`: "inspiration"
-            //
-            // Earlier we put the user text into `prompt` and Suno dutifully
-            // sang it back as lyrics. The fix is `gpt_description_prompt`.
-            let mut sreq = GenerateRequest::new(&model_key, "inspiration");
-            sreq.token = Some(captcha_token);
-            sreq.title = Some(String::new());
-            sreq.tags = Some(String::new());
-            sreq.prompt = String::new();
-            sreq.gpt_description_prompt = Some(d.prompt.trim().to_string());
-            sreq.make_instrumental = d.instrumental;
-
-            let song_id = melodie_db::songs::create(
-                &state.db,
-                NewSong {
-                    owner_id: user.id,
-                    mode: SongMode::Describe,
-                    title: None,
-                    tags: None,
-                    exclude_tags: None,
-                    lyrics: None,
-                    prompt: Some(&d.prompt),
-                    vocal: None,
-                    weirdness: None,
-                    style_inf: None,
-                    variation: None,
-                    model: &model_key,
-                },
-            )
-            .await?;
-
-            (sreq, song_id, model_key)
-        }
+    // Build the engine tags exactly like the HeartMuLa reference
+    // (`server.py:297-298`): a lowercase, comma-joined, space-free list with the
+    // language first — `"<language>,<style1>,<style2>,…"`. The raw `styles`
+    // string is what we persist as the song's `tags`.
+    let language = req.language.trim().to_lowercase();
+    let normalized_styles = req
+        .styles
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(",");
+    let tags = if language.is_empty() {
+        normalized_styles
+    } else {
+        format!("{language},{normalized_styles}")
     };
 
-    // --- shared tail: submit, persist clips, spawn poller, return view ---
+    // Create the song row (`songs::create` inserts it with `status =
+    // 'generating'`). Persist the raw styles as the song's tags plus the
+    // chosen language; `lyrics` is handed to the engine unchanged.
+    let song_id = melodie_db::songs::create(
+        &state.db,
+        NewSong {
+            owner_id: user.id,
+            title: None,
+            tags: Some(&req.styles),
+            lyrics: Some(&req.lyrics),
+            language: &language,
+            model: req.model.trim(),
+        },
+    )
+    .await?;
+    let lyrics = req.lyrics.clone();
 
-    let _ = model_key; // model_key is captured into the DB row above; silence unused-binding lint
-
-    let suno_clips = match client.generate(&sreq).await {
-        Ok(clips) => clips,
-        Err(e) => {
-            // Generation failed; mark the song as failed so the user sees it
-            // in the list rather than a phantom "generating" stuck forever.
-            let _ = melodie_db::songs::set_status(
-                &state.db,
-                song_id,
-                SongStatus::Failed,
-                Some(&e.to_string()),
-            )
-            .await;
-            return Err(ApiError::from(e));
-        }
-    };
-
-    if suno_clips.is_empty() {
-        let _ = melodie_db::songs::set_status(
-            &state.db,
+    // One streaming clip up front so the UI has a row to follow; the worker
+    // flips it to complete/error when the generation finishes.
+    let clip_id = Uuid::new_v4().to_string();
+    melodie_db::clips::upsert_many(
+        &state.db,
+        &[UpsertClip {
+            id: clip_id.clone(),
             song_id,
-            SongStatus::Failed,
-            Some("Suno returned 0 clips"),
-        )
-        .await;
-        return Err(ApiError::Internal(
-            "Suno returned 0 clips for a successful generate".into(),
-        ));
+            variant_index: 0,
+            status: "streaming".into(),
+            duration_s: None,
+            image_url: None,
+        }],
+    )
+    .await?;
+
+    // Hand the work to the engine worker thread, which drives the clip/song
+    // updates and the SSE broadcast itself.
+    if let Err(e) = state.engine.send(crate::engine::EngineJob {
+        song_id,
+        clip_id,
+        lyrics,
+        tags,
+        max_frames: 2250,
+    }) {
+        tracing::error!(error = %e, %song_id, "engine: failed to enqueue job");
     }
-
-    let upserts: Vec<UpsertClip> = suno_clips
-        .iter()
-        .enumerate()
-        .map(|(i, c)| UpsertClip {
-            id: c.id.clone(),
-            song_id,
-            variant_index: i as i32,
-            status: c.status.clone(),
-            duration_s: c.metadata.duration,
-            image_url: c.image_url.clone(),
-        })
-        .collect();
-    melodie_db::clips::upsert_many(&state.db, &upserts).await?;
-
-    let clip_ids: Vec<String> = suno_clips.iter().map(|c| c.id.clone()).collect();
-    crate::poll::spawn(state.clone(), song_id, clip_ids);
 
     let song = melodie_db::songs::find_with_clips(&state.db, song_id)
         .await?
@@ -512,18 +372,6 @@ async fn delete_song(
         return Err(ApiError::Forbidden);
     }
 
-    // Best-effort upstream trash. We log on failure and still delete locally —
-    // the user's intent is to remove the song from their view, not to keep
-    // garbage in our DB if Suno is down.
-    if let Some(client) = state.suno.current().await {
-        let clip_ids: Vec<String> = song.clips.iter().map(|c| c.id.clone()).collect();
-        if !clip_ids.is_empty()
-            && let Err(e) = client.delete_clips(&clip_ids).await
-        {
-            tracing::warn!(error = %e, song_id = %song_id, "suno delete_clips failed, deleting locally anyway");
-        }
-    }
-
     melodie_db::songs::delete(&state.db, song_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -537,71 +385,25 @@ fn parse_song_id(s: &str) -> ApiResult<SongId> {
 }
 
 fn validate_create(req: &CreateSongRequest) -> ApiResult<()> {
-    match req {
-        CreateSongRequest::Custom(c) => validate_custom(c),
-        CreateSongRequest::Describe(d) => validate_describe(d),
-    }
-}
-
-fn validate_custom(c: &CustomFields) -> ApiResult<()> {
-    let title = c.title.trim();
-    if title.is_empty() || title.len() > TITLE_MAX {
+    let styles = req.styles.trim();
+    if styles.is_empty() || styles.len() > TAGS_MAX {
         return Err(ApiError::BadRequest(format!(
-            "title must be 1-{TITLE_MAX} characters"
+            "styles must be 1-{TAGS_MAX} characters"
         )));
     }
-    let tags = c.tags.trim();
-    if tags.is_empty() || tags.len() > TAGS_MAX {
-        return Err(ApiError::BadRequest(format!(
-            "tags must be 1-{TAGS_MAX} characters"
-        )));
-    }
-    if let Some(excl) = c.exclude_tags.as_deref()
-        && excl.len() > EXCLUDE_MAX
-    {
-        return Err(ApiError::BadRequest(format!(
-            "exclude_tags must be at most {EXCLUDE_MAX} characters"
-        )));
-    }
-    let lyrics = c.lyrics.trim();
+    let lyrics = req.lyrics.trim();
     if lyrics.is_empty() || lyrics.len() > LYRICS_MAX {
         return Err(ApiError::BadRequest(format!(
             "lyrics must be 1-{LYRICS_MAX} characters"
         )));
     }
-    if let Some(v) = c.weirdness
-        && !(0..=100).contains(&v)
-    {
-        return Err(ApiError::BadRequest("weirdness must be 0-100".into()));
-    }
-    if let Some(v) = c.style_influence
-        && !(0..=100).contains(&v)
-    {
-        return Err(ApiError::BadRequest(
-            "style_influence must be 0-100".into(),
-        ));
-    }
-    if let Some(v) = c.vocal.as_deref()
-        && !matches!(v, "male" | "female")
-    {
-        return Err(ApiError::BadRequest("vocal must be 'male' or 'female'".into()));
-    }
-    if let Some(v) = c.variation.as_deref()
-        && !matches!(v, "high" | "normal" | "subtle")
-    {
-        return Err(ApiError::BadRequest(
-            "variation must be 'high', 'normal' or 'subtle'".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_describe(d: &DescribeFields) -> ApiResult<()> {
-    let prompt = d.prompt.trim();
-    if prompt.is_empty() || prompt.len() > PROMPT_MAX {
+    if req.language.len() > TITLE_MAX {
         return Err(ApiError::BadRequest(format!(
-            "prompt must be 1-{PROMPT_MAX} characters"
+            "language must be at most {TITLE_MAX} characters"
         )));
+    }
+    if req.model.trim().is_empty() {
+        return Err(ApiError::BadRequest("model is required".into()));
     }
     Ok(())
 }

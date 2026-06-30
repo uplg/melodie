@@ -36,12 +36,12 @@ export interface Clip {
 
 export interface Song {
   id: string;
-  mode: 'custom' | 'describe';
   title: string | null;
+  /** Comma-separated genres/moods the user typed (the "styles"). */
   tags: string | null;
-  exclude_tags: string | null;
   lyrics: string | null;
   prompt: string | null;
+  language: string;
   model: string;
   status: SongStatus;
   error: string | null;
@@ -65,6 +65,8 @@ export async function fetchMe(req: Request): Promise<User | null> {
 export interface SongEvent {
   song_id: string;
   status: SongStatus;
+  /** Coarse generation progress (0–100) on `generating` events; absent otherwise. */
+  progress?: number | null;
   clips: Array<{
     id: string;
     variant_index: number;
@@ -229,20 +231,6 @@ export async function createInvite(role: 'member' | 'admin'): Promise<Invite> {
     throw new Error(body?.error?.message ?? `createInvite failed: ${res.status}`);
   }
   return (await res.json()) as Invite;
-}
-
-export async function setSunoCookie(cookie: string): Promise<void> {
-  const res = await fetch('/api/admin/suno-auth', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clerk_cookie: cookie }),
-  });
-  if (!res.ok) {
-    const body = await res
-      .json()
-      .catch(() => null as { error?: { message?: string } } | null);
-    throw new Error(body?.error?.message ?? `setSunoCookie failed: ${res.status}`);
-  }
 }
 
 export interface QuotaRow {

@@ -33,9 +33,6 @@ pub enum ApiError {
     Db(#[from] melodie_db::DbError),
 
     #[error(transparent)]
-    Suno(#[from] suno_client::SunoError),
-
-    #[error(transparent)]
     Session(#[from] tower_sessions::session::Error),
 
     #[error("internal: {0}")]
@@ -55,8 +52,6 @@ impl ApiError {
             Self::Db(_) | Self::Session(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
-            Self::Suno(e) if e.is_auth() => (StatusCode::SERVICE_UNAVAILABLE, "suno_auth"),
-            Self::Suno(_) => (StatusCode::BAD_GATEWAY, "suno_upstream"),
         }
     }
 }

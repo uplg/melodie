@@ -1,8 +1,6 @@
 # Melodie
 
-Self-hosted Suno wrapper for a small group of friends. One Suno account
-upstream, N app users in front, per-user scoping, daily quotas, MP3 streaming.
-
+Self-hosted HeartMuLa wrapper for a small group of friends.
 Designed to run locally on the operator's machine and exposed publicly via
 `cloudflared` only during "live" sessions — keeps the Suno hCaptcha solver
 happy (it needs a real Chrome with a warm browser fingerprint) and avoids
@@ -12,7 +10,6 @@ running anything 24/7.
 
 - Backend: Rust 2024, axum 0.8, SQLite (sqlx), tower-sessions, argon2id
 - Frontend: Astro 6 SSR (Node) + React 19 islands, TypeScript strict, Tailwind v4
-- Suno bridge: `crates/suno-client` (vendored from `paperfoot/suno-cli`)
 
 ## Layout
 
