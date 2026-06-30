@@ -1,7 +1,7 @@
 //! # melodie-engine
 //!
-//! Local, pure-Rust ([candle]) inference engine for **HeartMuLa**, replacing the
-//! Suno bridge (`suno-client`) inside Mélodie. Ported from the MLX reference at
+//! Local, pure-Rust ([candle]) inference engine for **HeartMuLa** — the music
+//! generator that powers Mélodie. Ported from the MLX reference at
 //! `../heartlib-mlx` (verified architecture, June 2026).
 //!
 //! ## What it runs
@@ -16,7 +16,7 @@
 //! - **P1** [`codec`] decoder (codes → waveform), validated in isolation
 //! - **P2** [`lm`] HeartMuLa (backbone + depth decoder + sampling + CFG)
 //! - **P3** [`pipeline`] end-to-end, parity vs the Python MLX reference
-//! - **P4** integration into `melodie-api` (replace `suno-client`)
+//! - **P4** integration into `melodie-api` (the production generation path)
 
 pub mod codec;
 pub mod config;
@@ -27,5 +27,5 @@ pub mod lm;
 pub mod parity;
 pub mod pipeline;
 
-pub use engine::{Audio, Engine, EngineConfig, GenOptions};
+pub use engine::{Audio, Engine, EngineConfig, GenOptions, GenProgress, GenStage};
 pub use error::{EngineError, Result};

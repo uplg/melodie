@@ -148,24 +148,21 @@ fn build_rope_cache(dim: usize, max_seq: usize, base: f64, scale: f64, dev: &Dev
 
 // --- attention (GQA) + KV cache -----------------------------------------
 
-#[derive(Default)]
+/// Pre-allocated KV cache: new keys/values are written in place (`slice_set`) into a buffer
+/// sized once, instead of `cat`-growing every frame. The `cat` form reallocated the whole
+/// cache each step and left a different-sized freed buffer that candle's Metal pool cannot
+/// reuse → multi-GB of churn per song (exactly what the per-frame `synchronize()` had to
+/// drain). Pre-allocating removes the churn at its root.
 struct LayerCache {
-    k: Option<Tensor>,
-    v: Option<Tensor>,
+    inner: candle_nn::kv_cache::KvCache,
 }
 impl LayerCache {
+    fn new(cap: usize) -> Self {
+        // sequence axis is dim 2 in `[B, H, S, D]`.
+        Self { inner: candle_nn::kv_cache::KvCache::new(2, cap) }
+    }
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = match &self.k {
-            Some(o) => Tensor::cat(&[o, k], 2)?,
-            None => k.clone(),
-        };
-        let v = match &self.v {
-            Some(o) => Tensor::cat(&[o, v], 2)?,
-            None => v.clone(),
-        };
-        self.k = Some(k.clone());
-        self.v = Some(v.clone());
-        Ok((k, v))
+        Ok(self.inner.append(k, v)?)
     }
 }
 
@@ -300,8 +297,8 @@ impl Transformer {
             eps: cfg.norm_eps,
         })
     }
-    fn fresh_caches(&self) -> Vec<LayerCache> {
-        (0..self.layers.len()).map(|_| LayerCache::default()).collect()
+    fn fresh_caches(&self, cap: usize) -> Vec<LayerCache> {
+        (0..self.layers.len()).map(|_| LayerCache::new(cap)).collect()
     }
     /// Forward `h [B,S,D]` at `positions [S]` with additive `mask [S,Skv]`; returns
     /// the normalised output upcast to f32.
@@ -479,7 +476,7 @@ impl HeartMuLaLm {
         let pos: Vec<u32> = (0..s as u32).collect();
         let pos = Tensor::from_vec(pos, s, dev)?;
         let m = causal_mask(s, dev)?;
-        let mut caches = self.backbone.fresh_caches();
+        let mut caches = self.backbone.fresh_caches(s);
         let out = self.backbone.forward(&h, &pos, &m, &mut caches)?; // [B,S,D] f32
         let last_h = out.narrow(1, s - 1, 1)?.squeeze(1)?.contiguous()?; // [B,D] (contiguous: Metal matmul mishandles strided B=2)
         let c0 = self.codebook0_head.fwd(&last_h)?; // [B,V]
@@ -492,7 +489,7 @@ impl HeartMuLaLm {
         let dev = last_h.device();
         let b = last_h.dim(0)?;
         let ncb = self.cfg.audio_num_codebooks;
-        let mut caches = self.decoder.fresh_caches();
+        let mut caches = self.decoder.fresh_caches(self.cfg.audio_num_codebooks + 1);
         let mut logits = Vec::new();
 
         // seed: [last_h, embed_audio(0, samples[:,0])]
@@ -544,7 +541,7 @@ impl HeartMuLaLm {
         let c0 = sample_topk(&c0_logits, topk, temperature, &uniforms.narrow(0, 0, 1)?)?;
         samples.push(c0);
 
-        let mut caches = self.decoder.fresh_caches();
+        let mut caches = self.decoder.fresh_caches(self.cfg.audio_num_codebooks + 1);
         // seed = [last_h (→bf16 for the bf16 decoder), embed_audio(0, c0)]
         let curr_h = Tensor::cat(&[&last_h.to_dtype(self.text_embeddings.dtype())?.unsqueeze(1)?, &self.embed_audio(0, &tok(c0)?)?], 1)?;
         let pos = Tensor::from_vec(vec![0u32, 1], 2, dev)?;
@@ -577,7 +574,7 @@ impl HeartMuLaLm {
         let mask2 = Tensor::cat(&[mask, mask], 0)?;
         let h0 = self.embed_and_sum(&tokens2, &mask2, true)?; // [2,S,D]
         let pos = Tensor::from_vec((0..s as u32).collect::<Vec<_>>(), s, dev)?;
-        let mut caches = self.backbone.fresh_caches();
+        let mut caches = self.backbone.fresh_caches(s);
         let out = self.backbone.forward(&h0, &pos, &causal_mask(s, dev)?, &mut caches)?;
         let last_h = out.narrow(1, s - 1, 1)?.squeeze(1)?.contiguous()?; // [2,D]
         self.sample_frame_cfg(&last_h, cfg, topk, temperature, uniforms)
@@ -597,7 +594,7 @@ impl HeartMuLaLm {
         let mut ci_guided = Vec::new();
         samples.push(sample_topk(&c0_guided, topk, temperature, &uniforms.narrow(0, 0, 1)?)?);
 
-        let mut caches = self.decoder.fresh_caches();
+        let mut caches = self.decoder.fresh_caches(self.cfg.audio_num_codebooks + 1);
         let c0_emb = self.embed_audio_dup(0, samples[0])?; // [2,1,D]
         let curr_h = Tensor::cat(&[&last_h.to_dtype(self.text_embeddings.dtype())?.unsqueeze(1)?, &c0_emb], 1)?; // [2,2,D]
         let pos = Tensor::from_vec(vec![0u32, 1], 2, dev)?;
@@ -660,7 +657,7 @@ impl HeartMuLaLm {
         }
         let mut tokens = vec![c0.clone()];
 
-        let mut caches = self.decoder.fresh_caches();
+        let mut caches = self.decoder.fresh_caches(self.cfg.audio_num_codebooks + 1);
         let last_hb = last_h.to_dtype(self.text_embeddings.dtype())?.unsqueeze(1)?;
         let curr_h = Tensor::cat(&[&last_hb, &embed(0, &c0)?], 1)?; // [B,2,D]
         let pos = Tensor::from_vec(vec![0u32, 1], 2, dev)?;
@@ -713,7 +710,17 @@ impl HeartMuLaLm {
     /// Autoregressive multi-frame generation: prompt → codes `[ncb, T]`. Backbone
     /// KV cache persists across frames; each frame feeds the previous frame's audio
     /// tokens; stops at EOS (codebook-0 ≥ 8193) or `max_frames`. RNG is self-generated.
-    pub fn generate_codes(&self, tokens: &Tensor, mask: &Tensor, muq_idx: Option<usize>, params: &GenParams) -> Result<Tensor> {
+    ///
+    /// `on_frame`, if set, is called as `(frames_done, max_frames)` every 8 frames —
+    /// purely for progress reporting; it has no effect on the generated codes.
+    pub fn generate_codes(
+        &self,
+        tokens: &Tensor,
+        mask: &Tensor,
+        muq_idx: Option<usize>,
+        params: &GenParams,
+        mut on_frame: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> Result<Tensor> {
         let GenParams { cfg_scale, max_frames, topk, temperature } = *params;
         let dev = tokens.device();
         let ncb = self.cfg.audio_num_codebooks;
@@ -722,7 +729,7 @@ impl HeartMuLaLm {
         let eos = 8193u32;
         let cfg = cfg_scale > 1.0; // B=2 (cond+uncond) when guiding
         let s = tokens.dim(1)?;
-        let mut bcaches = self.backbone.fresh_caches();
+        let mut bcaches = self.backbone.fresh_caches(s + max_frames);
 
         // frame 0: prompt forward (doubled for CFG; MuQ slot scattered per row)
         let (t0, m0) = if cfg {
@@ -758,6 +765,10 @@ impl HeartMuLaLm {
 
         let gpu_sample = std::env::var("MELODIE_GPUSAMPLE").is_ok();
         let mut frames: Vec<Vec<u32>> = Vec::new();
+        // All-zero generated-frame attention mask, allocated once and narrowed each step
+        // (Metal sdpa ignores it; the CPU parity path adds 0 → no-op). Avoids a fresh
+        // growing `(1, pos+1)` tensor every frame.
+        let gen_mask = Tensor::zeros((1, s + max_frames), DType::F32, dev)?;
         // `pos` is the absolute KV position (starts past the `s`-token prompt).
         for pos in s..s + max_frames {
             let tf = std::time::Instant::now();
@@ -789,7 +800,7 @@ impl HeartMuLaLm {
             let tg = if cfg { Tensor::cat(&[&tg1, &tg1], 0)? } else { tg1 };
             let t1 = std::time::Instant::now();
             let h_t = self.embed_and_sum(&tg, &mg, false)?;
-            let m = Tensor::zeros((1, pos + 1), DType::F32, dev)?;
+            let m = gen_mask.narrow(1, 0, pos + 1)?;
             let out = self.backbone.forward(&h_t, &Tensor::from_vec(vec![pos as u32], 1, dev)?, &m, &mut bcaches)?;
             last_h = out.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
             if prof {
@@ -807,12 +818,10 @@ impl HeartMuLaLm {
                 eprintln!("[dbg] last_h n={} maxabs={maxabs:.3e} minabs={minabs:.3e} nonfinite={bad} denorm={denorm}", v.len());
             }
             nf += 1;
-            // Drain candle's Metal buffer pool periodically. The causal mask `(1, pos+1)` and
-            // the attention's k^T copy both grow with `pos`, so every frame allocates a unique
-            // size → nothing is reused and the pool would balloon to the sum over the whole
-            // song (~GBs), OOM-ing Metal mid-generation and starving the codec that follows.
-            if nf.is_multiple_of(32) {
-                dev.synchronize()?;
+            if nf.is_multiple_of(8) {
+                if let Some(cb) = on_frame.as_deref_mut() {
+                    cb(nf, max_frames);
+                }
             }
         }
         if prof && nf > 0 {

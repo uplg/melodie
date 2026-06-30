@@ -14,6 +14,10 @@ pub struct SongEvent {
     pub song_id: String,
     pub status: String,
     pub clips: Vec<ClipEventView>,
+    /// Coarse generation progress, 0–100. `None` for terminal/non-progress events
+    /// (e.g. a `complete`/`failed` broadcast or a snapshot built from a [`Song`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +34,7 @@ impl SongEvent {
         Self {
             song_id: song.id.to_string(),
             status: song_status_str(song.status).to_string(),
+            progress: None,
             clips: song
                 .clips
                 .iter()

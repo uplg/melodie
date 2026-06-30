@@ -109,7 +109,7 @@ export default function CreatePanel({ onCreated }: Props) {
       lyrics: advanced.lyrics,
       instrumental: advanced.instrumental,
       // Sliders/selects only sent when the user moved away from the default —
-      // backend treats `null` as "let Suno decide".
+      // backend treats `null` as "use the engine default".
       weirdness: advanced.weirdness === 50 ? null : advanced.weirdness,
       style_influence:
         advanced.style_influence === 50 ? null : advanced.style_influence,
@@ -171,7 +171,7 @@ export default function CreatePanel({ onCreated }: Props) {
       <div>
         <h2 className="text-lg font-semibold tracking-tight">Create</h2>
         <p className="mt-1 text-sm text-neutral-500">
-          Suno generates two variants per request — both consume one quota slot.
+          The local engine renders one clip per request — one quota slot each.
         </p>
       </div>
 
@@ -197,7 +197,7 @@ export default function CreatePanel({ onCreated }: Props) {
       <div className="flex items-center justify-between gap-3 pt-1">
         <p className="text-xs text-neutral-500">
           {isSubmitting
-            ? 'Solving captcha + submitting to Suno — this can take ~30–60 s.'
+            ? 'Generating locally on the engine — this can take a few minutes.'
             : ' '}
         </p>
         <button
@@ -278,7 +278,7 @@ function SimpleFields({ state, update }: SimpleFieldsProps) {
         />
       </Field>
       <p className="text-xs text-neutral-500">
-        Suno picks the title, tags and lyrics from your prompt. Switch to Advanced
+        The engine picks the title, tags and lyrics from your prompt. Switch to Advanced
         for full control.
       </p>
       <label className="flex items-center gap-2 text-sm">

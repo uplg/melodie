@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Local HeartMuLa inference engine (pure-Rust, candle) that replaces the
-# Suno bridge. Ported from ../heartlib-mlx (HeartMuLa LM + HeartCodec).
+# Local HeartMuLa inference engine (pure-Rust, candle) — Mélodie's music
+# generator. Ported from ../heartlib-mlx (HeartMuLa LM + HeartCodec).
 # See crate docs (src/lib.rs) for the phased port plan.
 
 [dependencies]

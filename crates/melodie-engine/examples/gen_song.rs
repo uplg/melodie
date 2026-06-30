@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         let muq = if std::env::var("MELODIE_NOMUQ").is_ok() { None } else { Some(p.muq_idx) };
         let cfg: f64 = std::env::var("MELODIE_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
         println!("generating up to {frames} frames (muq={muq:?}, cfg={cfg})...");
-        lm.generate_codes(&p.tokens, &p.mask, muq, &GenParams { cfg_scale: cfg, max_frames: frames, topk: 50, temperature: 1.0 })?
+        lm.generate_codes(&p.tokens, &p.mask, muq, &GenParams { cfg_scale: cfg, max_frames: frames, topk: 50, temperature: 1.0 }, None)?
     };
     let t = codes.dim(1)?;
     println!("generated codes [8, {t}]");

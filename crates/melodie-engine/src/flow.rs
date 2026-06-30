@@ -135,9 +135,16 @@ impl Attn {
         let k = apply_rope(&split(self.k.fwd(x)?)?, cos, sin)?;
         let v = split(self.v.fwd(x)?)?;
         let scale = (dh as f64).powf(-0.5);
-        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?; // (B,H,T,T)
-        let w = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let out = w.matmul(&v)?; // (B,H,T,Dh)
+        // Fused SDPA on Metal — no T×T score materialisation. The FM denoiser is bidirectional,
+        // so full attention (do_causal = false). The manual path stays for CPU / head_dim > 256
+        // (Metal SDPA's limit). This attention dominates the codec runtime (~76% of it).
+        let out = if matches!(q.device(), candle_core::Device::Metal(_)) && dh <= 256 {
+            candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?
+        } else {
+            let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?; // (B,H,T,T)
+            let w = candle_nn::ops::softmax(&scores, D::Minus1)?;
+            w.matmul(&v)? // (B,H,T,Dh)
+        };
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, h * dh))?;
         self.o.fwd(&out)
     }

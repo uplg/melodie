@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 use melodie_engine::codec::{CodecWeights, ScalarDecoder};
 use melodie_engine::config::HeartCodecConfig;
 use melodie_engine::parity::max_abs_diff;
@@ -43,5 +43,20 @@ fn main() -> Result<()> {
             "PARITY OFF ❌"
         }
     );
+
+    // --- self-parity: streaming decode vs dense, on a longer random latent. The golden (32
+    //     frames) is too short to exercise the conv stack's receptive field; this finds the R
+    //     (context per chunk) at which streaming becomes bit-identical to the dense decode. ---
+    let l = 256usize;
+    let big = Tensor::randn(0f32, 1f32, (2, l, 128), &dev)?;
+    let dense = dec.decode_one(&big)?;
+    let dlen = dense.dim(1)?;
+    println!("self-parity dense vs streaming, latent L={l} (dense len={dlen}):");
+    for r in [16usize, 24, 32, 48, 64] {
+        let s = dec.decode_streaming(&big, 64, r)?;
+        let m = dlen.min(s.dim(1)?);
+        let sd = max_abs_diff(&dense.narrow(1, 0, m)?, &s.narrow(1, 0, m)?)?;
+        println!("  CH=64 R={r:3} → max|Δ|={sd:.3e}  (stream len={})", s.dim(1)?);
+    }
     Ok(())
 }

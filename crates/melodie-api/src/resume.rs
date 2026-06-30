@@ -36,5 +36,15 @@ pub async fn resume_in_flight(pool: SqlitePool) {
         }
     }
 
+    // The buried songs' clips are stuck `streaming` too — bury them as well, else the UI keeps
+    // showing a forever-"generating" clip (progress bar / partial player) under a failed song.
+    // Runs before the worker starts, so every `streaming` clip here is genuinely orphaned.
+    if let Err(e) = sqlx::query("UPDATE clips SET status = 'error' WHERE status = 'streaming'")
+        .execute(&pool)
+        .await
+    {
+        tracing::warn!(error = %e, "resume: bury in-flight clips failed");
+    }
+
     tracing::info!(buried, "marked interrupted in-flight songs as failed");
 }

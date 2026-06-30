@@ -83,14 +83,76 @@ fn conv1d(
     dilation: usize,
 ) -> Result<Tensor> {
     let k = w.dim(2)?;
-    // causal = left-only pad of dilation*(k-1); non-causal = symmetric padding.
-    let (padding, xin) = if causal {
-        (0, x.pad_with_zeros(2, dilation * (k - 1), 0)?)
+    // Pad manually (causal = left-only `dilation*(k-1)`; non-causal = symmetric) so the
+    // chunked conv can run with padding 0.
+    let xin = if causal {
+        x.pad_with_zeros(2, dilation * (k - 1), 0)?
     } else {
-        ((k * dilation - dilation) / 2, x.clone())
+        let p = (k * dilation - dilation) / 2;
+        x.pad_with_zeros(2, p, p)?
     };
-    let cfg = Conv1dConfig { padding, stride, dilation, groups: 1, ..Default::default() };
-    Ok(Conv1d::new(w.clone(), Some(b.clone()), cfg).forward(&xin)?)
+    conv1d_chunked(&xin, w, b, stride, dilation)
+}
+
+/// Conv1d (padding 0) over an already-padded input, run in fixed-size time chunks so the
+/// `im2col` working set stays bounded regardless of sequence length. Equal-size chunks let
+/// candle's Metal pool reuse buffers (no varying-size churn) — so this needs no `synchronize()`
+/// and lets the FULL stereo batch decode without OOM, ~2× faster than per-channel. Each output
+/// index is computed from exactly its receptive field, so the result is bit-identical to one
+/// un-chunked conv.
+fn conv1d_chunked(
+    xpadded: &Tensor,
+    w: &Tensor,
+    b: &Tensor,
+    stride: usize,
+    dilation: usize,
+) -> Result<Tensor> {
+    const CHUNK: usize = 1 << 16; // output frames per chunk
+    let k = w.dim(2)?;
+    let lp = xpadded.dim(2)?;
+    let recep = (k - 1) * dilation; // span beyond the first output sample
+    let lo = (lp - recep - 1) / stride + 1; // total output length
+    let cfg = Conv1dConfig { padding: 0, stride, dilation, groups: 1, ..Default::default() };
+    let conv = Conv1d::new(w.clone(), Some(b.clone()), cfg);
+    if lo <= CHUNK {
+        return Ok(conv.forward(xpadded)?);
+    }
+    let mut outs: Vec<Tensor> = Vec::new();
+    let mut a = 0usize;
+    while a < lo {
+        let bb = (a + CHUNK).min(lo);
+        let in_start = a * stride;
+        let in_len = (bb - 1 - a) * stride + recep + 1;
+        outs.push(conv.forward(&xpadded.narrow(2, in_start, in_len)?)?);
+        a = bb;
+    }
+    Ok(Tensor::cat(&outs, 2)?)
+}
+
+/// Optional observers passed to [`HeartCodec::detokenize`]. Both are purely observational —
+/// the returned waveform is identical with or without them.
+#[derive(Default)]
+pub struct DetokCb<'a> {
+    /// Called `(segments_done, total_segments)` after each segment decodes.
+    pub on_seg: Option<&'a mut dyn FnMut(usize, usize)>,
+    /// Called with each newly-FINALISED interleaved-stereo PCM chunk (`l,r,l,r,…`), for
+    /// streaming the mp3 out while generation is still running.
+    pub on_audio: Option<&'a mut dyn FnMut(&[f32])>,
+}
+
+/// `(2, k)` planar stereo → interleaved `[l0,r0,l1,r1,…]`. Reads each channel separately (the
+/// same proven Metal→host path as the non-streaming output build) and interleaves on the host,
+/// rather than a device-side transpose+contiguous of a large tensor mid-decode.
+fn interleave_stereo(chunk: &Tensor) -> Result<Vec<f32>> {
+    let (c, n) = chunk.dims2()?;
+    let ch0: Vec<f32> = chunk.narrow(0, 0, 1)?.flatten_all()?.to_vec1()?;
+    let ch1: Vec<f32> = chunk.narrow(0, 1.min(c - 1), 1)?.flatten_all()?.to_vec1()?;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        out.push(ch0[i]);
+        out.push(ch1[i]);
+    }
+    Ok(out)
 }
 
 /// Insert `stride-1` zeros between successive time samples (NCL, dim 2):
@@ -119,8 +181,7 @@ fn conv_transpose1d_causal_manual(
     let k = w_inok.dim(2)?;
     let xu = zero_stuff_time(x, stride)?.pad_with_zeros(2, k - 1, k - 1)?;
     let kern = flip_last_dim(&w_inok.permute((1, 0, 2))?.contiguous()?)?; // (out,in,k), k-flipped
-    let cfg = Conv1dConfig { padding: 0, stride: 1, ..Default::default() };
-    let y = Conv1d::new(kern, Some(b.clone()), cfg).forward(&xu)?;
+    let y = conv1d_chunked(&xu, &kern, b, 1, 1)?; // stride 1, dilation 1, input already padded
     let l = y.dim(2)?;
     Ok(y.narrow(2, 0, l - stride)?)
 }
@@ -273,38 +334,59 @@ impl ScalarDecoder {
     /// to ONE item — roughly halving the decode's peak GPU residency vs the batched form,
     /// which keeps long songs inside this Mac's memory budget. The conv stack is
     /// batch-independent, so this is bit-identical to decoding the full batch at once.
+    /// Decode `(N, L, C)` → `(N, L*1920)` via the full-stack streaming pass (`decode_streaming`):
+    /// the whole stereo batch in one go, chunked along time. Verified **bit-identical** to a
+    /// dense decode for `R ≥ 48` (the conv stack's receptive span — see `parity_scalar`'s
+    /// self-parity sweep). The defaults keep a safety margin and bound the chunk so the batched
+    /// decode fits the GPU; both are env-overridable for tuning.
     pub fn decode(&self, latent_nlc: &Tensor) -> Result<Tensor> {
-        let n = latent_nlc.dim(0)?;
-        if n <= 1 {
-            return self.decode_one(latent_nlc);
-        }
-        let mut outs = Vec::with_capacity(n);
-        for i in 0..n {
-            outs.push(self.decode_one(&latent_nlc.narrow(0, i, 1)?)?);
-            latent_nlc.device().synchronize()?;
-        }
-        Ok(Tensor::cat(&outs, 0)?)
+        // Large chunk + minimal context (≈ the ~48-frame receptive span, +margin) keeps the
+        // re-decoded overlap small while still bounding the batched activations.
+        let ch =
+            std::env::var("MELODIE_DECODE_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(384);
+        let r = std::env::var("MELODIE_DECODE_R").ok().and_then(|s| s.parse().ok()).unwrap_or(52);
+        self.decode_streaming(latent_nlc, ch, r)
     }
 
-    /// Decode a single-item batch `(1, L, C)` through the full conv stack.
-    fn decode_one(&self, latent_nlc: &Tensor) -> Result<Tensor> {
+    /// Full-stack streaming decode: split the latent along time, decode each chunk — the WHOLE
+    /// stereo batch at once — with `r` latent frames of real context each side (≥ the conv
+    /// stack's receptive span, ~48), keeping only the chunk's middle. Bounds the full-resolution
+    /// block activations so the batched decode fits the GPU and runs in one pass (~2× faster than
+    /// per-channel). Bit-identical to the dense decode: `k = 2·stride` makes the upsampling an
+    /// exact ×1920, so each chunk's middle aligns at `(a-lo)*up`.
+    pub fn decode_streaming(&self, latent_nlc: &Tensor, ch: usize, r: usize) -> Result<Tensor> {
+        let l = latent_nlc.dim(1)?;
+        if l <= ch + 2 * r {
+            return self.decode_one(latent_nlc);
+        }
+        // samples produced per input latent frame (product of upsample strides × the ×2 post).
+        let up: usize = self.blocks.iter().map(|b| b.stride).product::<usize>() * 2;
+        let mut outs: Vec<Tensor> = Vec::new();
+        let mut a = 0usize;
+        while a < l {
+            let b = (a + ch).min(l);
+            let lo = a.saturating_sub(r); // real left context
+            let hi = (b + r).min(l); //      real right context
+            let audio = self.decode_one(&latent_nlc.narrow(1, lo, hi - lo)?)?;
+            let avail = audio.dim(1)?;
+            let left = ((a - lo) * up).min(avail); // drop the left warm-up
+            let take = ((b - a) * up).min(avail - left); // keep this chunk's middle
+            outs.push(audio.narrow(1, left, take)?);
+            a = b;
+        }
+        Ok(Tensor::cat(&outs, 1)?)
+    }
+
+    pub fn decode_one(&self, latent_nlc: &Tensor) -> Result<Tensor> {
         // (1, L, C) → (1, C, L) and scalar-quantise
         let x = latent_nlc.transpose(1, 2)?.contiguous()?;
         let x = round9(&x)?;
         let mut x = conv1d(&x, &self.conv0_w, &self.conv0_b, false, 1, 1)?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
-            // Bound peak memory across the ×1920 upsampling. candle (eager) pools every
-            // intermediate for reuse, but each stage's conv `im2col` is a different size so
-            // nothing is reused — the pool otherwise grows to the SUM of all stages (~32 GB,
-            // OOM → corrupted output). synchronize() flushes the GPU and drops the now-dead
-            // pooled buffers (the candle analogue of the reference's per-segment `mx.eval`),
-            // capping the peak at a single stage's working set. No-op on CPU.
-            x.device().synchronize()?;
         }
         x = self.post.forward(&x)?;
         x = conv1d(&x, &self.conv7_w, &self.conv7_b, true, 1, 1)?;
-        x.device().synchronize()?;
         // (1, 1, L) → (1, L)
         Ok(x.squeeze(1)?)
     }
@@ -371,6 +453,9 @@ impl HeartCodec {
     /// initial latent `(1, 2*min_samples, 256)` for deterministic parity; when `None`
     /// every segment's latent (and the in-context random pad) is drawn with `randn` —
     /// matching the reference, which draws all randomness internally.
+    ///
+    /// `on_seg`, if set, is called `(segments_done, total_segments)` as each segment's
+    /// decode finishes — purely for progress reporting; it has no numerical effect.
     pub fn detokenize(
         &self,
         codes: &Tensor,
@@ -378,6 +463,7 @@ impl HeartCodec {
         duration: f64,
         num_steps: usize,
         gs: f64,
+        mut cb: DetokCb,
     ) -> Result<Tensor> {
         let dev = codes.device();
 
@@ -415,6 +501,9 @@ impl HeartCodec {
             codes = codes.narrow(2, 0, len_codes)?;
         }
         let total = codes.dim(2)?;
+        // Segments the loop below will emit (sinx = 0, hop, 2·hop, … while sinx+hop ≤ total).
+        // total ≥ min_samples > hop_samples here, so this is ≥ 1; saturating_sub guards anyway.
+        let total_segments = total.saturating_sub(hop_samples) / hop_samples + 1;
 
         // --- audio overlap-add constants (used inside the segment loop) ---
         let min_samples_audio = (duration * sample_rate as f64) as usize; // 1428480
@@ -438,6 +527,8 @@ impl HeartCodec {
         let mut prev_latent: Option<Tensor> = None;
         let mut output: Option<Tensor> = None;
         let mut sinx = 0usize;
+        let mut seg_done = 0usize;
+        let mut emitted = 0usize; // audio samples already streamed via on_audio
         while sinx + hop_samples <= total {
             let codes_input = codes.narrow(2, sinx, min_samples)?; // (1,Q,min_samples)
             let latents = if sinx == 0 || ovlp_frames == 0 {
@@ -512,6 +603,26 @@ impl HeartCodec {
             sinx += hop_samples;
             // Free this segment's FM + decode GPU residency before the next segment.
             dev.synchronize()?;
+            seg_done += 1;
+            if let Some(f) = cb.on_seg.as_deref_mut() {
+                f(seg_done, total_segments);
+            }
+            // Stream the newly-finalised audio: everything except the trailing overlap (which
+            // the next segment's crossfade still rewrites); on the last segment, up to target_len.
+            if let Some(f) = cb.on_audio.as_deref_mut() {
+                let out = output.as_ref().unwrap();
+                let cur_len = out.dim(1)?;
+                let final_end = if seg_done == total_segments {
+                    target_len.min(cur_len)
+                } else {
+                    cur_len.saturating_sub(ovlp_samples_audio)
+                };
+                if final_end > emitted {
+                    let pcm = interleave_stereo(&out.narrow(1, emitted, final_end - emitted)?)?;
+                    f(&pcm);
+                    emitted = final_end;
+                }
+            }
         }
 
         let output = output.unwrap();

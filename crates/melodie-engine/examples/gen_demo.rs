@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         let cfg: f64 = std::env::var("MELODIE_CFG").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
         println!("generating {frames} frames (multi-frame loop, cfg={cfg})...");
         let t0 = std::time::Instant::now();
-        let c = lm.generate_codes(&tokens, &mask, None, &GenParams { cfg_scale: cfg, max_frames: frames, topk: 50, temperature: 1.0 })?;
+        let c = lm.generate_codes(&tokens, &mask, None, &GenParams { cfg_scale: cfg, max_frames: frames, topk: 50, temperature: 1.0 }, None)?;
         let el = t0.elapsed().as_secs_f32();
         println!("  generation: {el:.1} s ({:.0} ms/frame)", el * 1000.0 / frames as f32);
         c

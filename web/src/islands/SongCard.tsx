@@ -37,6 +37,10 @@ export default function SongCard({
   onRename,
   owner,
 }: Props) {
+  // Coarse generation progress (0–100), fed by the SSE `progress` field. Null
+  // until the first progress event arrives (and for terminal events).
+  const [progress, setProgress] = useState<number | null>(null);
+
   // Subscribe to live updates while the song is still in flight. EventSource
   // is same-origin (proxied via /api/*), so cookies ride along automatically.
   useEffect(() => {
@@ -47,6 +51,7 @@ export default function SongCard({
       try {
         const data: SongEvent = JSON.parse(e.data);
         onUpdate(data);
+        if (typeof data.progress === 'number') setProgress(data.progress);
         if (data.status === 'complete' || data.status === 'failed') {
           es.close();
         }
@@ -91,7 +96,7 @@ export default function SongCard({
   }, [song.id, song.status, onUpdate]);
 
   const handleDelete = () => {
-    if (confirm(`Delete "${song.title ?? 'untitled'}"? This trashes the clips on Suno too.`)) {
+    if (confirm(`Delete "${song.title ?? 'untitled'}"?`)) {
       onDelete(song.id);
     }
   };
@@ -178,6 +183,10 @@ export default function SongCard({
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          {(song.status === 'generating' || song.status === 'pending') &&
+            progress !== null && (
+              <span className="text-xs tabular-nums text-neutral-500">{progress}%</span>
+            )}
           <StatusBadge status={song.status} />
           <button
             type="button"
@@ -205,6 +214,8 @@ export default function SongCard({
             clip={clip}
             title={song.title}
             features={features}
+            codecStarted={song.status === 'complete' || (progress ?? 0) > 80}
+            progress={progress}
             alreadyProposed={proposedClipIds.has(clip.id)}
             onClubProposed={onClubProposed}
           />
@@ -218,19 +229,25 @@ function ClipSlot({
   clip,
   title,
   features,
+  codecStarted,
+  progress,
   alreadyProposed,
   onClubProposed,
 }: {
   clip: Clip;
   title: string | null;
   features: Features;
+  codecStarted: boolean;
+  progress: number | null;
   alreadyProposed: boolean;
   onClubProposed: (clipId: string) => void;
 }) {
-  // Audio is served only once the clip is fully rendered (the engine writes the mp3 at the
-  // end), so only offer the player on `complete`; `streaming` shows a generating hint and
-  // never hits the audio endpoint (no 404 mid-generation).
-  const playable = clip.status === 'complete';
+  // Play once audio actually exists on disk: on `complete`, or while `streaming` ONCE the codec
+  // stage has started (`codecStarted` ⇒ progress > 80%, i.e. ≥ 1 segment written). Fetching
+  // during the long LM stage would hold the SSR proxy on an empty growing file past undici's
+  // body timeout and tank the page.
+  const playable =
+    clip.status === 'complete' || (clip.status === 'streaming' && codecStarted);
   const downloadName = `${slugify(title ?? 'melodie')}-${clip.id.slice(0, 8)}.mp3`;
   const audioUrl = `/api/clips/${clip.id}/audio`;
 
@@ -269,8 +286,18 @@ function ClipSlot({
             />
           </div>
         </>
+      ) : clip.status === 'error' ? (
+        <p className="text-xs text-red-600 dark:text-red-400">Generation failed.</p>
       ) : (
-        <div className="h-10 rounded bg-neutral-100 dark:bg-neutral-800 animate-pulse" />
+        <div className="space-y-1">
+          <div className="h-2 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+            <div
+              className="h-full rounded-full bg-amber-500 transition-[width] duration-500 ease-out"
+              style={{ width: `${progress ?? 0}%` }}
+            />
+          </div>
+          <div className="text-right text-[11px] tabular-nums text-neutral-500">{progress ?? 0}%</div>
+        </div>
       )}
     </div>
   );
