@@ -275,9 +275,17 @@ impl ScalarDecoder {
         let mut x = conv1d(&x, &self.conv0_w, &self.conv0_b, false, 1, 1)?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
+            // Bound peak memory across the ×1920 upsampling. candle (eager) pools every
+            // intermediate for reuse, but each stage's conv `im2col` is a different size so
+            // nothing is reused — the pool otherwise grows to the SUM of all stages (~32 GB,
+            // OOM → corrupted output). synchronize() flushes the GPU and drops the now-dead
+            // pooled buffers (the candle analogue of the reference's per-segment `mx.eval`),
+            // capping the peak at a single stage's working set. No-op on CPU.
+            x.device().synchronize()?;
         }
         x = self.post.forward(&x)?;
         x = conv1d(&x, &self.conv7_w, &self.conv7_b, true, 1, 1)?;
+        x.device().synchronize()?;
         // (N, 1, L) → (N, L)
         Ok(x.squeeze(1)?)
     }
