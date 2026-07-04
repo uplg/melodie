@@ -27,10 +27,34 @@ web/              # Astro 7 app
 
 - Rust stable (edition 2024 — see `rust-toolchain.toml`)
 - macOS with Apple Silicon (the engine targets candle's Metal backend)
-- HeartMuLa checkpoints + tokenizer on disk (see `MELODIE_LM_DIR`,
-  `MELODIE_CODEC_DIR`, `MELODIE_TOKENIZER` in `.env.example`)
+- HeartMuLa checkpoints + tokenizer on disk — see [Models](#models)
 - `cloudflared` on `PATH` — only when sharing a session with friends
 - Node ≥ 22, bun
+
+## Models
+
+The engine loads the **original** HeartMuLa safetensors with candle. 
+Three artifacts are needed
+(~21 GB total, ~15 GB LM + ~6 GB codec):
+
+| Piece         | Hugging Face repo                          | Files                                   |
+| ------------- | ------------------------------------------ | --------------------------------------- |
+| LM (3B)       | `HeartMuLa/HeartMuLa-oss-3B-happy-new-year`| `model-0000{1..4}-of-00004.safetensors` |
+| Codec         | `HeartMuLa/HeartCodec-oss-20260123`        | `model-0000{1..2}-of-00002.safetensors` |
+| Tokenizer     | `HeartMuLa/HeartMuLaGen`                   | `tokenizer.json`                        |
+
+Fetch everything with curl (no Python, no `hf` CLI; resumable and idempotent —
+re-run it after an interrupted download and it picks up where it left off):
+
+```bash
+just fetch-models   # → data/models/ (override with MELODIE_MODELS_DIR)
+```
+
+`.env.example` already points `MELODIE_LM_DIR`, `MELODIE_CODEC_DIR` and
+`MELODIE_TOKENIZER` at `data/models/`. If you already have the checkpoints
+(e.g. `heartlib-mlx`'s `ckpt/`), skip the download and point those three vars
+at the existing directories instead — the files are byte-identical to what
+`hf download` fetches.
 
 ## Dev
 

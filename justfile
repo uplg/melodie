@@ -38,6 +38,38 @@ gate:
 run:
     cargo run -p melodie-api
 
+# --- Models: fetch the HeartMuLa checkpoints straight from Hugging Face.
+#     curl-only (no Python/hf CLI), resumable, idempotent. ~21 GB total.
+#     The engine reads the original safetensors — no MLX conversion step. ---
+
+fetch-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="${MELODIE_MODELS_DIR:-data/models}"
+    fetch() { # <hf-repo> <remote-file> <dest>
+        local url="https://huggingface.co/$1/resolve/main/$2" dest="$3" remote
+        mkdir -p "$(dirname "$dest")"
+        remote=$(curl -sIL "$url" | awk 'tolower($1)=="content-length:"{n=$2} END{print n+0}')
+        if [[ -f "$dest" && "$(stat -f%z "$dest")" -eq "$remote" ]]; then
+            echo "✓ $dest (already complete)"
+            return
+        fi
+        echo "▶ $dest ($remote bytes)"
+        curl -fL --retry 3 -C - --progress-bar -o "$dest" "$url"
+    }
+    for i in 1 2 3 4; do
+        fetch HeartMuLa/HeartMuLa-oss-3B-happy-new-year \
+            "model-0000$i-of-00004.safetensors" \
+            "$dir/HeartMuLa-oss-3B/model-0000$i-of-00004.safetensors"
+    done
+    for i in 1 2; do
+        fetch HeartMuLa/HeartCodec-oss-20260123 \
+            "model-0000$i-of-00002.safetensors" \
+            "$dir/HeartCodec-oss/model-0000$i-of-00002.safetensors"
+    done
+    fetch HeartMuLa/HeartMuLaGen tokenizer.json "$dir/tokenizer.json"
+    echo "✓ all models under $dir/ — MELODIE_LM_DIR/MELODIE_CODEC_DIR/MELODIE_TOKENIZER in .env"
+
 # --- Frontend ---
 
 web-install:
