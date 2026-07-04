@@ -44,7 +44,7 @@ impl Default for GenOptions {
     fn default() -> Self {
         Self {
             max_frames: 2250,
-            cfg_scale: 1.5,
+            cfg_scale: 1.25,
             topk: 50,
             temperature: 1.0,
         }
