@@ -23,9 +23,9 @@ fn silu(x: &Tensor) -> Result<Tensor> {
 
 /// RMSNorm with weight, eps (matches mlx nn.RMSNorm).
 fn rmsnorm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
-    let ms = x.sqr()?.mean_keepdim(D::Minus1)?; // (.,1)
-    let xn = x.broadcast_div(&(ms + eps)?.sqrt()?)?;
-    Ok(xn.broadcast_mul(w)?)
+    // candle's fused RMSNorm kernel (1 Metal launch vs ~6 hand-rolled ops); the
+    // reduction runs in f32 — the DiT is f32 throughout, so numerics are unchanged.
+    Ok(candle_nn::ops::rms_norm(&x.contiguous()?, w, eps as f32)?)
 }
 
 /// Parameter-free LayerNorm (elementwise_affine=False): (x-mean)/sqrt(var+eps).
@@ -97,18 +97,10 @@ fn rope_tables(t: usize, dim: usize, base: f64, dev: &Device) -> Result<(Tensor,
 }
 
 /// Apply interleaved RoPE to (B,H,T,D) with cos/sin (T,D/2) (transformer.py:31-64).
+/// Same math as the reference's hand-rolled form (even/odd pairs, x1·cos−x2·sin /
+/// x1·sin+x2·cos) but via candle's fused kernel: 1 launch vs ~10.
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (b, h, t, d) = x.dims4()?;
-    let half = d / 2;
-    let xr = x.reshape((b, h, t, half, 2))?;
-    let x1 = xr.narrow(4, 0, 1)?.squeeze(4)?; // (B,H,T,half)
-    let x2 = xr.narrow(4, 1, 1)?.squeeze(4)?;
-    let cos = cos.reshape((1, 1, t, half))?;
-    let sin = sin.reshape((1, 1, t, half))?;
-    let r1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
-    let r2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
-    let rot = Tensor::stack(&[r1, r2], 4)?; // (B,H,T,half,2)
-    Ok(rot.reshape((b, h, t, d))?)
+    Ok(candle_nn::rotary_emb::rope_i(&x.contiguous()?, cos, sin)?)
 }
 
 // --- attention / mlp / block --------------------------------------------
@@ -282,7 +274,15 @@ pub struct Dit {
     proj_out: ProjectLayer,
     head_dim1: usize,
     head_dim2: usize,
+    /// RoPE cos/sin tables for both stages, precomputed to `ROPE_T_MAX` at load —
+    /// `forward` narrows to its `t` instead of rebuilding them every Euler step.
+    rope1: (Tensor, Tensor),
+    rope2: (Tensor, Tensor),
 }
+
+/// Longest sequence the precomputed DiT RoPE tables cover (segments are 744
+/// latent frames; anything longer falls back to building tables on the fly).
+const ROPE_T_MAX: usize = 2048;
 
 impl Dit {
     pub fn load(w: &CodecWeights, cfg: &DitConfig) -> Result<Self> {
@@ -296,10 +296,12 @@ impl Dit {
                 .map(|i| Block::load(w, &format!("{p}.{list}.{i}"), cfg.num_heads, hd, dim))
                 .collect()
         };
+        let sst1 = w.tensor(&format!("{p}.scale_shift_table"))?;
+        let dev = sst1.device().clone();
         Ok(Self {
             proj_in: ProjectLayer::load(w, &format!("{p}.proj_in"), 3)?,
             blocks1: load_blocks("transformer_blocks", cfg.num_layers_stage1, inner, hd1)?,
-            sst1: w.tensor(&format!("{p}.scale_shift_table"))?,
+            sst1,
             adaln1: AdaLnSingle::load(w, &format!("{p}.adaln_single"))?,
             connection_proj: ProjectLayer::load(w, &format!("{p}.connection_proj"), 3)?,
             blocks2: load_blocks("transformer_blocks_2", cfg.num_layers_stage2, inner2, hd2)?,
@@ -308,7 +310,23 @@ impl Dit {
             proj_out: ProjectLayer::load(w, &format!("{p}.proj_out"), 3)?,
             head_dim1: hd1,
             head_dim2: hd2,
+            rope1: rope_tables(ROPE_T_MAX, hd1, 10000.0, &dev)?,
+            rope2: rope_tables(ROPE_T_MAX, hd2, 10000.0, &dev)?,
         })
+    }
+
+    /// Precomputed RoPE tables narrowed to `t` (or rebuilt if `t > ROPE_T_MAX`).
+    fn rope_for(&self, stage: usize, t: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+        let ((cos, sin), hd) = if stage == 1 {
+            (&self.rope1, self.head_dim1)
+        } else {
+            (&self.rope2, self.head_dim2)
+        };
+        if t <= ROPE_T_MAX {
+            Ok((cos.narrow(0, 0, t)?, sin.narrow(0, 0, t)?))
+        } else {
+            rope_tables(t, hd, 10000.0, dev)
+        }
     }
 
     /// hidden (B,T,in_channels), timestep (B,) → (B,T,out_channels).
@@ -318,7 +336,7 @@ impl Dit {
 
         let mut s = self.proj_in.fwd(hidden)?; // (B,T,inner)
         let (tmod1, emb1) = self.adaln1.fwd(timestep, dev)?;
-        let (cos1, sin1) = rope_tables(t, self.head_dim1, 10000.0, dev)?;
+        let (cos1, sin1) = self.rope_for(1, t, dev)?;
         for blk in &self.blocks1 {
             s = blk.fwd(&s, &tmod1, &cos1, &sin1)?;
         }
@@ -331,7 +349,7 @@ impl Dit {
         let mut x = Tensor::cat(&[hidden, &s], D::Minus1)?; // (B,T,in+inner)
         x = self.connection_proj.fwd(&x)?; // (B,T,inner2)
         let (tmod2, emb2) = self.adaln2.fwd(timestep, dev)?;
-        let (cos2, sin2) = rope_tables(t, self.head_dim2, 10000.0, dev)?;
+        let (cos2, sin2) = self.rope_for(2, t, dev)?;
         for blk in &self.blocks2 {
             x = blk.fwd(&x, &tmod2, &cos2, &sin2)?;
         }
@@ -493,6 +511,15 @@ impl FlowMatching {
         let num_frames = x_init.dim(1)?;
         let mu_zeros = mu.zeros_like()?;
         let mut x = x_init.clone(); // (1,2T,256)
+        // CFG batch halves that don't change across Euler steps, concatenated once.
+        let (ic2, mu2) = if gs > 1.0 {
+            (
+                Some(Tensor::cat(&[incontext_x, incontext_x], 0)?),
+                Some(Tensor::cat(&[&mu_zeros, mu], 0)?), // [uncond=zeros ; cond=mu]
+            )
+        } else {
+            (None, None)
+        };
         // t_span = linspace(0,1,num_steps+1) ⇒ uniform dt = 1/num_steps, t = step*dt.
         let dt = 1.0f64 / num_steps as f64;
         for step in 0..num_steps {
@@ -511,9 +538,8 @@ impl FlowMatching {
             let dphi = if gs > 1.0 {
                 // Classifier-free guidance: batch [uncond(mu=0) ; cond(mu)].
                 let x2 = Tensor::cat(&[&x, &x], 0)?;
-                let ic2 = Tensor::cat(&[incontext_x, incontext_x], 0)?;
-                let mu2 = Tensor::cat(&[&mu_zeros, mu], 0)?; // [uncond=zeros ; cond=mu]
-                let combined = Tensor::cat(&[&x2, &ic2, &mu2], 2)?; // (2,2T,1024)
+                let (ic2, mu2) = (ic2.as_ref().unwrap(), mu2.as_ref().unwrap());
+                let combined = Tensor::cat(&[&x2, ic2, mu2], 2)?; // (2,2T,1024)
                 let t_input = Tensor::from_vec(vec![tval as f32; 2], 2, dev)?;
                 let dphi = self.dit.forward(&combined, &t_input)?; // (2,2T,256)
                 let uncond = dphi.narrow(0, 0, 1)?;

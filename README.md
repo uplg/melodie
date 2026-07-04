@@ -26,7 +26,9 @@ web/              # Astro 7 app
 ## Prerequisites
 
 - Rust stable (edition 2024 — see `rust-toolchain.toml`)
-- macOS with Apple Silicon (the engine targets candle's Metal backend)
+- macOS with Apple Silicon, ≥ 32 GB unified memory (the engine targets candle's
+  Metal backend; ~14 GB resident once loaded — 7.5 GB LM bf16 + 6.3 GB codec —
+  with a ~16 GB transient peak while the checkpoints load)
 - HeartMuLa checkpoints + tokenizer on disk — see [Models](#models)
 - `cloudflared` on `PATH` — only when sharing a session with friends
 - Node ≥ 22, bun

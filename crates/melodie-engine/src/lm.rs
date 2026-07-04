@@ -113,12 +113,30 @@ impl Lin {
         // instead of a batched 3D gemm that re-reads the weight per batch element
         // (~2.7x slower for B=2 / CFG). Reshape of a contiguous tensor is a free view.
         if let [b, s, d] = *x.dims() {
-            let y = self.0.forward(&x.reshape((b * s, d))?)?;
+            let y = self.fwd2d(&x.reshape((b * s, d))?)?;
             let n = y.dim(1)?;
             Ok(y.reshape((b, s, n))?)
         } else {
-            Ok(self.0.forward(x)?)
+            self.fwd2d(x)
         }
+    }
+    fn fwd2d(&self, x: &Tensor) -> Result<Tensor> {
+        // The decode hot path is M=2 (CFG cond+uncond, S=1). candle's Metal backend only
+        // dispatches its MLX gemv kernel for M==1; M=2 falls onto the tiled gemm, which
+        // measures ~82–124 GB/s on these skinny shapes vs ~150–290 GB/s for TWO gemv
+        // calls (bench: [3072x8192] bf16 0.407 ms gemm vs 0.173 ms for both gemvs, even
+        // though the weight is read twice). So split M=2 into per-row gemvs on Metal.
+        // bf16 only: the f32 heads measured FASTER as one M=2 gemm (247 vs 201 GB/s).
+        // Metal only: keeps the CPU parity path on its exact original kernel.
+        if matches!(x.dims2(), Ok((2, _)))
+            && x.dtype() == DType::BF16
+            && matches!(x.device(), Device::Metal(_))
+        {
+            let y0 = self.0.forward(&x.narrow(0, 0, 1)?)?;
+            let y1 = self.0.forward(&x.narrow(0, 1, 1)?)?;
+            return Ok(Tensor::cat(&[&y0, &y1], 0)?);
+        }
+        Ok(self.0.forward(x)?)
     }
 }
 
@@ -218,9 +236,9 @@ impl Attn {
     fn fwd(
         &self,
         x: &Tensor,
-        rope_cache: &Tensor,
-        positions: &Tensor, // u32 [Sx]
-        add_mask: &Tensor,  // [Sx, Skv] additive (0 / -1e9)
+        cos: &Tensor, // [Sx, dh/2] at x's dtype (hoisted: identical across layers)
+        sin: &Tensor,
+        add_mask: &Tensor, // [Sx, Skv] additive (0 / -1e9)
         cache: &mut LayerCache,
     ) -> Result<Tensor> {
         let (b, sx, _) = x.dims3()?;
@@ -243,23 +261,8 @@ impl Attn {
             .reshape((b, sx, nkv, dh))?
             .transpose(1, 2)?
             .contiguous()?;
-        // fused interleaved RoPE (1 kernel vs ~10 hand-rolled ops); cos/sin [Sx, dh/2]
-        let rc = rope_cache.index_select(positions, 0)?; // [Sx, dh/2, 2]
-        let cos = rc
-            .narrow(2, 0, 1)?
-            .squeeze(2)?
-            .to_dtype(q.dtype())?
-            .contiguous()?;
-        let sin = rc
-            .narrow(2, 1, 1)?
-            .squeeze(2)?
-            .to_dtype(q.dtype())?
-            .contiguous()?;
-        let q = candle_nn::rotary_emb::rope_i(&q, &cos, &sin)?;
-        let k = candle_nn::rotary_emb::rope_i(&k, &cos, &sin)?;
-        let k = Self::expand_kv(&k, h / nkv)?; // [B,H,Sx,D]
-        let v = Self::expand_kv(&v, h / nkv)?;
-        let (k, v) = cache.append(&k, &v)?; // [B,H,Skv,D]
+        let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
         // Fused scaled-dot-product attention: one kernel for scores+softmax+(@v) and,
         // crucially, it never materialises k^T — the manual path copied the WHOLE KV
         // cache every frame (O(cache) → O(T²) over a song; ~7x slower at cache 500).
@@ -269,7 +272,11 @@ impl Attn {
             // Used for the backbone (head_dim 128, large cache); the depth decoder
             // (head_dim 384, unsupported by Metal SDPA) falls to the manual path below —
             // its cache is ≤9 so the k^T copy is negligible there.
+            // GQA: K/V are cached UNexpanded ([B,nkv,S,D]) — the SDPA kernel maps each
+            // query head to its kv group itself, so the cache holds (and the kernel
+            // reads) 3× less than the expanded form. Same dot products, same output.
             // do_causal covers the prompt (Sx>1); a single generated token attends all.
+            let (k, v) = cache.append(&k, &v)?; // [B,nkv,Skv,D]
             candle_nn::ops::sdpa(
                 &q,
                 &k,
@@ -280,6 +287,9 @@ impl Attn {
                 1.0,
             )?
         } else {
+            let k = Self::expand_kv(&k, h / nkv)?; // [B,H,Sx,D]
+            let v = Self::expand_kv(&v, h / nkv)?;
+            let (k, v) = cache.append(&k, &v)?; // [B,H,Skv,D]
             // CPU (parity only — SDPA has no CPU impl): manual attention with the mask.
             let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? / (dh as f64).sqrt())?;
             let skv = k.dim(2)?;
@@ -337,18 +347,15 @@ impl Layer {
     fn fwd(
         &self,
         x: &Tensor,
-        rope: &Tensor,
-        pos: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
         mask: &Tensor,
         cache: &mut LayerCache,
     ) -> Result<Tensor> {
-        let h = (self.attn.fwd(
-            &rmsnorm(x, &self.sa_norm, self.eps)?,
-            rope,
-            pos,
-            mask,
-            cache,
-        )? + x)?;
+        let h = (self
+            .attn
+            .fwd(&rmsnorm(x, &self.sa_norm, self.eps)?, cos, sin, mask, cache)?
+            + x)?;
         Ok((self.mlp.fwd(&rmsnorm(&h, &self.mlp_norm, self.eps)?)? + &h)?)
     }
 }
@@ -403,9 +410,22 @@ impl Transformer {
         let do_dbg = std::env::var("MELODIE_DBG").is_ok()
             && is_bb
             && FWD.fetch_add(1, Ordering::Relaxed) == 15;
+        // fused interleaved RoPE cos/sin [Sx, dh/2]: identical for every layer, so
+        // gather+cast ONCE per forward instead of once per layer (28× fewer tiny kernels).
+        let rc = self.rope_cache.index_select(positions, 0)?; // [Sx, dh/2, 2]
+        let cos = rc
+            .narrow(2, 0, 1)?
+            .squeeze(2)?
+            .to_dtype(h.dtype())?
+            .contiguous()?;
+        let sin = rc
+            .narrow(2, 1, 1)?
+            .squeeze(2)?
+            .to_dtype(h.dtype())?
+            .contiguous()?;
         let mut h = h.clone();
         for (i, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
-            h = layer.fwd(&h, &self.rope_cache, positions, mask, cache)?;
+            h = layer.fwd(&h, &cos, &sin, mask, cache)?;
             if do_dbg {
                 let v: Vec<f32> = h.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                 let denorm = v
@@ -495,6 +515,30 @@ fn sample_topk_gpu(
     score.argmax(D::Minus1).map_err(Into::into) // [1] u32
 }
 
+/// Constant tensors of the depth-decoder frame loop, built once per generation.
+/// Each was previously a fresh host→device upload EVERY frame (positions, masks) —
+/// pure launch/blit overhead on a loop that runs 8× per frame, 12.5×/s.
+struct DepthConsts {
+    pos01: Tensor,        // [2] u32 {0,1} — seed step positions
+    mask2: Tensor,        // causal 2×2 additive mask for the seed step
+    pos_cb: Vec<Tensor>,  // pos_cb[cb] = [1] u32 {cb+1}
+    mask_cb: Vec<Tensor>, // mask_cb[cb] = zeros (1, cb+2)
+}
+impl DepthConsts {
+    fn new(ncb: usize, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            pos01: Tensor::from_vec(vec![0u32, 1], 2, dev)?,
+            mask2: causal_mask(2, dev)?,
+            pos_cb: (0..ncb)
+                .map(|cb| Ok(Tensor::from_vec(vec![(cb + 1) as u32], 1, dev)?))
+                .collect::<Result<Vec<_>>>()?,
+            mask_cb: (0..ncb)
+                .map(|cb| Ok(Tensor::zeros((1, cb + 2), DType::F32, dev)?))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
 // --- HeartMuLa wrapper ---------------------------------------------------
 
 /// Sampling knobs for [`HeartMuLaLm::generate_codes`] (grouped so the call stays
@@ -521,12 +565,17 @@ pub struct HeartMuLaLm {
     audio_head: Tensor,  // [ncb-1, D, V]
     muq_bias: Tensor,    // muq_linear bias (= muq_linear(zeros), the MuQ-slot embedding)
     uncond_text: Tensor, // unconditional_text_embedding [1, D] (CFG null token)
+    cb_offsets: Tensor,  // [1,1,ncb] f32 per-codebook vocab offsets (constant)
     cfg: HeartMuLaConfig,
 }
 
 impl HeartMuLaLm {
     pub fn load(w: &LmWeights, dev: &Device) -> Result<Self> {
         let cfg = HeartMuLaConfig::default();
+        let offsets: Vec<f32> = (0..cfg.audio_num_codebooks)
+            .map(|c| (c * cfg.audio_vocab_size) as f32)
+            .collect();
+        let cb_offsets = Tensor::from_vec(offsets, (1, 1, cfg.audio_num_codebooks), dev)?;
         Ok(Self {
             backbone: Transformer::load(w, "backbone", &cfg.backbone, &cfg, dev)?,
             decoder: Transformer::load(w, "decoder", &cfg.decoder, &cfg, dev)?,
@@ -537,6 +586,7 @@ impl HeartMuLaLm {
             audio_head: w.t_head("audio_head")?,
             muq_bias: w.t("muq_linear.bias")?,
             uncond_text: w.t("unconditional_text_embedding.weight")?,
+            cb_offsets,
             cfg,
         })
     }
@@ -592,15 +642,11 @@ impl HeartMuLaLm {
                 .contiguous()?;
             text = Tensor::cat(&[&text.narrow(0, 0, actual)?, &ut], 0)?;
         }
-        // audio channels with per-codebook offset
-        let offsets: Vec<f32> = (0..ncb)
-            .map(|c| (c * self.cfg.audio_vocab_size) as f32)
-            .collect();
-        let offsets = Tensor::from_vec(offsets, (1, 1, ncb), tokens.device())?;
+        // audio channels with per-codebook offset (constant tensor, built at load)
         let audio_tok = tokens
             .narrow(2, 0, ncb)?
             .to_dtype(DType::F32)?
-            .broadcast_add(&offsets)?;
+            .broadcast_add(&self.cb_offsets)?;
         let audio_idx = audio_tok.to_dtype(DType::U32)?.flatten_all()?;
         let audio = self
             .audio_embeddings
@@ -842,8 +888,8 @@ impl HeartMuLaLm {
         topk: usize,
         temperature: f64,
         uniforms: &Tensor,
+        dc: &DepthConsts,
     ) -> Result<Tensor> {
-        let dev = last_h.device();
         let ncb = self.cfg.audio_num_codebooks;
         let cfg = last_h.dim(0)? == 2;
         let guide = |logits: &Tensor| -> Result<Tensor> {
@@ -897,12 +943,11 @@ impl HeartMuLaLm {
             .to_dtype(self.text_embeddings.dtype())?
             .unsqueeze(1)?;
         let curr_h = Tensor::cat(&[&last_hb, &embed(0, &c0)?], 1)?; // [B,2,D]
-        let pos = Tensor::from_vec(vec![0u32, 1], 2, dev)?;
         let td = std::time::Instant::now();
         let dh = self.decoder.forward(
             &self.projection.fwd(&curr_h)?,
-            &pos,
-            &causal_mask(2, dev)?,
+            &dc.pos01,
+            &dc.mask2,
             &mut caches,
         )?;
         if prof2 {
@@ -928,12 +973,13 @@ impl HeartMuLaLm {
                 break;
             }
             let emb = embed(cb, &ci)?;
-            let pos = Tensor::from_vec(vec![(cb + 1) as u32], 1, dev)?;
-            let m = Tensor::zeros((1, cb + 2), DType::F32, dev)?;
             let td = std::time::Instant::now();
-            let dh = self
-                .decoder
-                .forward(&self.projection.fwd(&emb)?, &pos, &m, &mut caches)?;
+            let dh = self.decoder.forward(
+                &self.projection.fwd(&emb)?,
+                &dc.pos_cb[cb],
+                &dc.mask_cb[cb],
+                &mut caches,
+            )?;
             if prof2 {
                 sync_f(&dh)?;
                 t_dec += td.elapsed();
@@ -1043,6 +1089,10 @@ impl HeartMuLaLm {
         // (Metal sdpa ignores it; the CPU parity path adds 0 → no-op). Avoids a fresh
         // growing `(1, pos+1)` tensor every frame.
         let gen_mask = Tensor::zeros((1, s + max_frames), DType::F32, dev)?;
+        // Per-frame constants: depth-loop tensors and the absolute-position ladder,
+        // built once instead of re-uploaded host→device every frame.
+        let dc = DepthConsts::new(ncb, dev)?;
+        let pos_all = Tensor::arange(0u32, (s + max_frames) as u32, dev)?;
         // `pos` is the absolute KV position (starts past the `s`-token prompt).
         for pos in s..s + max_frames {
             let tf = std::time::Instant::now();
@@ -1050,7 +1100,7 @@ impl HeartMuLaLm {
             let t0 = std::time::Instant::now();
             let frame = if gpu_sample {
                 // 8 codebooks sampled on-device (no per-codebook sync), 1 readback/frame
-                self.sample_frame_gpu(&last_h, cfg_scale, topk, temperature, &uniforms)?
+                self.sample_frame_gpu(&last_h, cfg_scale, topk, temperature, &uniforms, &dc)?
                     .to_vec1::<u32>()?
             } else if cfg {
                 self.sample_frame_cfg(&last_h, cfg_scale, topk, temperature, &uniforms)?
@@ -1081,12 +1131,9 @@ impl HeartMuLaLm {
             let t1 = std::time::Instant::now();
             let h_t = self.embed_and_sum(&tg, &mg, false)?;
             let m = gen_mask.narrow(1, 0, pos + 1)?;
-            let out = self.backbone.forward(
-                &h_t,
-                &Tensor::from_vec(vec![pos as u32], 1, dev)?,
-                &m,
-                &mut bcaches,
-            )?;
+            let out = self
+                .backbone
+                .forward(&h_t, &pos_all.narrow(0, pos, 1)?, &m, &mut bcaches)?;
             last_h = out.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
             if prof {
                 let e = t1.elapsed();
