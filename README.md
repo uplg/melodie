@@ -44,8 +44,7 @@ just dev          # api + web in parallel
 ## Going live
 
 ```bash
-just live                                  # in one terminal
-cloudflared tunnel --url http://localhost:3000   # in another
+just live
 ```
 
 `cloudflared` prints a `*.trycloudflare.com` URL — share it with your friends
