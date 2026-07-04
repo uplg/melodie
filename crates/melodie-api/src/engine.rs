@@ -158,13 +158,17 @@ pub fn spawn_worker(
                             )
                             .map_err(|e| e.to_string())
                     };
-                    match dur {
+                    let r = match dur {
                         Ok(d) => enc.finish().map(|_| d),
-                        Err(e) => {
-                            let _ = std::fs::remove_file(&path);
-                            Err(e)
-                        }
+                        Err(e) => Err(e),
+                    };
+                    // On ANY failure — generation or the mp3 tail flush — don't leave a
+                    // truncated {clip_id}.mp3 behind: the clip is marked "error" but the
+                    // audio route would still happily serve the broken file.
+                    if r.is_err() {
+                        let _ = std::fs::remove_file(&path);
                     }
+                    r
                 }
                 Err(e) => Err(e),
             };

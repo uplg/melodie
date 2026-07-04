@@ -8,7 +8,7 @@
 //! Layout: the reference runs in (B,T,C); we keep (B,T,C) here and only drop to
 //! (B,C,T) inside the ProjectLayer convs.
 
-use candle_core::{D, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Linear, Module};
 
 use crate::Result;
@@ -29,19 +29,26 @@ fn rmsnorm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// Parameter-free LayerNorm (elementwise_affine=False): (x-mean)/sqrt(var+eps).
+/// The reduction runs in f32 even for bf16 inputs (mean/var in bf16 lose ~3 digits);
+/// on the f32 path the upcasts are no-ops, so parity is unchanged.
 fn layernorm_free(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dt = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
     let mean = x.mean_keepdim(D::Minus1)?;
     let xc = x.broadcast_sub(&mean)?;
     let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
-    Ok(xc.broadcast_div(&(var + eps)?.sqrt()?)?)
+    Ok(xc.broadcast_div(&(var + eps)?.sqrt()?)?.to_dtype(dt)?)
 }
 
 struct Lin(Linear);
 impl Lin {
     fn load(w: &CodecWeights, prefix: &str, bias: bool) -> Result<Self> {
-        let weight = w.tensor(&format!("{prefix}.weight"))?;
+        Self::load_dt(w, prefix, bias, DType::F32)
+    }
+    fn load_dt(w: &CodecWeights, prefix: &str, bias: bool, dt: DType) -> Result<Self> {
+        let weight = w.tensor(&format!("{prefix}.weight"))?.to_dtype(dt)?;
         let b = if bias {
-            Some(w.tensor(&format!("{prefix}.bias"))?)
+            Some(w.tensor(&format!("{prefix}.bias"))?.to_dtype(dt)?)
         } else {
             None
         };
@@ -60,11 +67,11 @@ struct ProjectLayer {
     kernel: usize,
 }
 impl ProjectLayer {
-    fn load(w: &CodecWeights, prefix: &str, kernel: usize) -> Result<Self> {
+    fn load(w: &CodecWeights, prefix: &str, kernel: usize, dt: DType) -> Result<Self> {
         Ok(Self {
-            conv_w: w.tensor(&format!("{prefix}.ffn_1.weight"))?, // (out,in,k)
-            conv_b: w.tensor(&format!("{prefix}.ffn_1.bias"))?,
-            ffn2: Lin::load(w, &format!("{prefix}.ffn_2"), true)?,
+            conv_w: w.tensor(&format!("{prefix}.ffn_1.weight"))?.to_dtype(dt)?, // (out,in,k)
+            conv_b: w.tensor(&format!("{prefix}.ffn_1.bias"))?.to_dtype(dt)?,
+            ffn2: Lin::load_dt(w, &format!("{prefix}.ffn_2"), true, dt)?,
             kernel,
         })
     }
@@ -114,12 +121,18 @@ struct Attn {
     head_dim: usize,
 }
 impl Attn {
-    fn load(w: &CodecWeights, prefix: &str, n_heads: usize, head_dim: usize) -> Result<Self> {
+    fn load(
+        w: &CodecWeights,
+        prefix: &str,
+        n_heads: usize,
+        head_dim: usize,
+        dt: DType,
+    ) -> Result<Self> {
         Ok(Self {
-            q: Lin::load(w, &format!("{prefix}.q_proj"), false)?,
-            k: Lin::load(w, &format!("{prefix}.k_proj"), false)?,
-            v: Lin::load(w, &format!("{prefix}.v_proj"), false)?,
-            o: Lin::load(w, &format!("{prefix}.o_proj"), false)?,
+            q: Lin::load_dt(w, &format!("{prefix}.q_proj"), false, dt)?,
+            k: Lin::load_dt(w, &format!("{prefix}.k_proj"), false, dt)?,
+            v: Lin::load_dt(w, &format!("{prefix}.v_proj"), false, dt)?,
+            o: Lin::load_dt(w, &format!("{prefix}.o_proj"), false, dt)?,
             n_heads,
             head_dim,
         })
@@ -155,11 +168,11 @@ struct Mlp {
     down: Lin,
 }
 impl Mlp {
-    fn load(w: &CodecWeights, prefix: &str) -> Result<Self> {
+    fn load(w: &CodecWeights, prefix: &str, dt: DType) -> Result<Self> {
         Ok(Self {
-            gate: Lin::load(w, &format!("{prefix}.gate"), false)?,
-            up: Lin::load(w, &format!("{prefix}.up"), false)?,
-            down: Lin::load(w, &format!("{prefix}.down"), false)?,
+            gate: Lin::load_dt(w, &format!("{prefix}.gate"), false, dt)?,
+            up: Lin::load_dt(w, &format!("{prefix}.up"), false, dt)?,
+            down: Lin::load_dt(w, &format!("{prefix}.down"), false, dt)?,
         })
     }
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
@@ -183,13 +196,20 @@ impl Block {
         n_heads: usize,
         head_dim: usize,
         dim: usize,
+        dt: DType,
     ) -> Result<Self> {
         Ok(Self {
-            attn_norm: w.tensor(&format!("{prefix}.attn_norm.weight"))?,
-            attn: Attn::load(w, &format!("{prefix}.attn"), n_heads, head_dim)?,
-            mlp_norm: w.tensor(&format!("{prefix}.mlp_norm.weight"))?,
-            mlp: Mlp::load(w, &format!("{prefix}.mlp"))?,
-            scale_shift_table: w.tensor(&format!("{prefix}.scale_shift_table"))?,
+            attn_norm: w
+                .tensor(&format!("{prefix}.attn_norm.weight"))?
+                .to_dtype(dt)?,
+            attn: Attn::load(w, &format!("{prefix}.attn"), n_heads, head_dim, dt)?,
+            mlp_norm: w
+                .tensor(&format!("{prefix}.mlp_norm.weight"))?
+                .to_dtype(dt)?,
+            mlp: Mlp::load(w, &format!("{prefix}.mlp"), dt)?,
+            scale_shift_table: w
+                .tensor(&format!("{prefix}.scale_shift_table"))?
+                .to_dtype(dt)?,
             dim,
         })
     }
@@ -240,19 +260,31 @@ struct AdaLnSingle {
     ts_l2: Lin,
     linear: Lin,
     flow_t_size: usize,
+    dt: DType,
 }
 impl AdaLnSingle {
-    fn load(w: &CodecWeights, prefix: &str) -> Result<Self> {
+    fn load(w: &CodecWeights, prefix: &str, dt: DType) -> Result<Self> {
         Ok(Self {
-            ts_l1: Lin::load(w, &format!("{prefix}.emb.timestep_embedder.linear_1"), true)?,
-            ts_l2: Lin::load(w, &format!("{prefix}.emb.timestep_embedder.linear_2"), true)?,
-            linear: Lin::load(w, &format!("{prefix}.linear"), true)?,
+            ts_l1: Lin::load_dt(
+                w,
+                &format!("{prefix}.emb.timestep_embedder.linear_1"),
+                true,
+                dt,
+            )?,
+            ts_l2: Lin::load_dt(
+                w,
+                &format!("{prefix}.emb.timestep_embedder.linear_2"),
+                true,
+                dt,
+            )?,
+            linear: Lin::load_dt(w, &format!("{prefix}.linear"), true, dt)?,
             flow_t_size: 512,
+            dt,
         })
     }
     /// returns (timestep_mod (B,6*D), embedded_timestep (B,D)).
     fn fwd(&self, t: &Tensor, dev: &Device) -> Result<(Tensor, Tensor)> {
-        let proj = timestep_sinusoid(t, self.flow_t_size, dev)?; // (B,512)
+        let proj = timestep_sinusoid(t, self.flow_t_size, dev)?.to_dtype(self.dt)?; // (B,512)
         let embedded = self.ts_l2.fwd(&silu(&self.ts_l1.fwd(&proj)?)?)?; // (B,D)
         let tmod = self.linear.fwd(&silu(&embedded)?)?; // (B,6D)
         Ok((tmod, embedded))
@@ -278,6 +310,12 @@ pub struct Dit {
     /// `forward` narrows to its `t` instead of rebuilding them every Euler step.
     rope1: (Tensor, Tensor),
     rope2: (Tensor, Tensor),
+    /// Compute dtype: bf16 on Metal by default — speed-neutral on M1 Max (the
+    /// estimator's gemms are large-M compute-bound) but ~1.5 GB less resident
+    /// weight memory. `MELODIE_CODEC_F32=1` opts back into the f32 numerics for
+    /// A/B listening; CPU is always f32 (bit-exact parity). The Euler solver
+    /// stays f32 either way — `forward` casts at its boundary.
+    dt: DType,
 }
 
 /// Longest sequence the precomputed DiT RoPE tables cover (segments are 744
@@ -291,27 +329,43 @@ impl Dit {
         let hd1 = cfg.head_dim; // 64
         let hd2 = cfg.head_dim * 2; // 128
         let p = "flow_matching.estimator";
-        let load_blocks = |list: &str, n: usize, dim: usize, hd: usize| -> Result<Vec<Block>> {
-            (0..n)
-                .map(|i| Block::load(w, &format!("{p}.{list}.{i}"), cfg.num_heads, hd, dim))
-                .collect()
-        };
         let sst1 = w.tensor(&format!("{p}.scale_shift_table"))?;
         let dev = sst1.device().clone();
+        // bf16 measured speed-NEUTRAL on M1 Max (the DiT's gemms are large-M compute-bound,
+        // and Apple GPUs don't run bf16 math faster than f32) but halves the estimator's
+        // resident weights (~1.5 GB) — the default for the 32 GB target. MELODIE_CODEC_F32=1
+        // restores the f32 numerics for A/B listening.
+        let dt = if matches!(dev, Device::Metal(_)) && std::env::var("MELODIE_CODEC_F32").is_err() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        let load_blocks = |list: &str, n: usize, dim: usize, hd: usize| -> Result<Vec<Block>> {
+            (0..n)
+                .map(|i| Block::load(w, &format!("{p}.{list}.{i}"), cfg.num_heads, hd, dim, dt))
+                .collect()
+        };
+        let rope_dt = |hd: usize| -> Result<(Tensor, Tensor)> {
+            let (c, s) = rope_tables(ROPE_T_MAX, hd, 10000.0, &dev)?;
+            Ok((c.to_dtype(dt)?, s.to_dtype(dt)?))
+        };
         Ok(Self {
-            proj_in: ProjectLayer::load(w, &format!("{p}.proj_in"), 3)?,
+            proj_in: ProjectLayer::load(w, &format!("{p}.proj_in"), 3, dt)?,
             blocks1: load_blocks("transformer_blocks", cfg.num_layers_stage1, inner, hd1)?,
-            sst1,
-            adaln1: AdaLnSingle::load(w, &format!("{p}.adaln_single"))?,
-            connection_proj: ProjectLayer::load(w, &format!("{p}.connection_proj"), 3)?,
+            sst1: sst1.to_dtype(dt)?,
+            adaln1: AdaLnSingle::load(w, &format!("{p}.adaln_single"), dt)?,
+            connection_proj: ProjectLayer::load(w, &format!("{p}.connection_proj"), 3, dt)?,
             blocks2: load_blocks("transformer_blocks_2", cfg.num_layers_stage2, inner2, hd2)?,
-            sst2: w.tensor(&format!("{p}.scale_shift_table_2"))?,
-            adaln2: AdaLnSingle::load(w, &format!("{p}.adaln_single_2"))?,
-            proj_out: ProjectLayer::load(w, &format!("{p}.proj_out"), 3)?,
+            sst2: w
+                .tensor(&format!("{p}.scale_shift_table_2"))?
+                .to_dtype(dt)?,
+            adaln2: AdaLnSingle::load(w, &format!("{p}.adaln_single_2"), dt)?,
+            proj_out: ProjectLayer::load(w, &format!("{p}.proj_out"), 3, dt)?,
             head_dim1: hd1,
             head_dim2: hd2,
-            rope1: rope_tables(ROPE_T_MAX, hd1, 10000.0, &dev)?,
-            rope2: rope_tables(ROPE_T_MAX, hd2, 10000.0, &dev)?,
+            rope1: rope_dt(hd1)?,
+            rope2: rope_dt(hd2)?,
+            dt,
         })
     }
 
@@ -330,9 +384,13 @@ impl Dit {
     }
 
     /// hidden (B,T,in_channels), timestep (B,) → (B,T,out_channels).
+    /// Input/output stay f32 (the Euler solver's dtype); the estimator body runs
+    /// at `self.dt` (bf16 on Metal) between the two boundary casts.
     pub fn forward(&self, hidden: &Tensor, timestep: &Tensor) -> Result<Tensor> {
         let dev = hidden.device();
         let t = hidden.dim(1)?;
+        let in_dt = hidden.dtype();
+        let hidden = &hidden.to_dtype(self.dt)?;
 
         let mut s = self.proj_in.fwd(hidden)?; // (B,T,inner)
         let (tmod1, emb1) = self.adaln1.fwd(timestep, dev)?;
@@ -358,7 +416,7 @@ impl Dit {
         let scale2 = mod2.narrow(1, 1, 1)?;
         x = (layernorm_free(&x, 1e-6)?.broadcast_mul(&(scale2 + 1.0)?)?).broadcast_add(&shift2)?;
 
-        self.proj_out.fwd(&x)
+        Ok(self.proj_out.fwd(&x)?.to_dtype(in_dt)?)
     }
 }
 

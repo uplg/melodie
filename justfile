@@ -35,9 +35,6 @@ gate:
     just test
     just deny
 
-run:
-    cargo run -p melodie-api
-
 # --- Models: fetch the HeartMuLa checkpoints straight from Hugging Face.
 #     curl-only (no Python/hf CLI), resumable, idempotent. ~21 GB total.
 #     The engine reads the original safetensors — no MLX conversion step. ---
@@ -81,7 +78,9 @@ web-dev:
 web-build:
     cd web && bun run build
 
-# --- Full dev: HMR-friendly api + Vite dev server. Use this while iterating. ---
+# --- Full dev: HMR-friendly api + Vite dev server. Use this while iterating.
+#     (Deps are compiled at opt-level 3 — see Cargo.toml — so the engine runs at
+#     near-release speed even in dev builds.) ---
 
 dev:
     #!/usr/bin/env bash

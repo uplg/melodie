@@ -79,12 +79,13 @@ impl AppConfig {
 
 impl EngineSettings {
     fn from_env() -> Self {
+        // Defaults match `just fetch-models` / .env.example (README "Models").
         let lm_dir = std::env::var("MELODIE_LM_DIR")
-            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/HeartMuLa-oss-3B".into());
+            .unwrap_or_else(|_| "data/models/HeartMuLa-oss-3B".into());
         let codec_dir = std::env::var("MELODIE_CODEC_DIR")
-            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/HeartCodec-oss".into());
+            .unwrap_or_else(|_| "data/models/HeartCodec-oss".into());
         let tokenizer = std::env::var("MELODIE_TOKENIZER")
-            .unwrap_or_else(|_| "/Users/leonard/Github/heartlib-mlx/ckpt/tokenizer.json".into());
+            .unwrap_or_else(|_| "data/models/tokenizer.json".into());
         let audio_dir = std::env::var("MELODIE_AUDIO_DIR").unwrap_or_else(|_| "data/audio".into());
 
         Self {

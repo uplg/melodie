@@ -55,13 +55,32 @@ just fetch-models   # → data/models/ (override with MELODIE_MODELS_DIR)
 `.env.example` already points `MELODIE_LM_DIR`, `MELODIE_CODEC_DIR` and
 `MELODIE_TOKENIZER` at `data/models/`.
 
+## Engine knobs
+
+All optional. The defaults ARE the fastest and most memory-efficient measured
+setup on Apple Silicon (bf16 LM + GQA KV cache, Q8_0 depth decoder, bf16 codec
+DiT — LM ≈ 59 ms/frame on an M1 Max, faster than realtime): only set these to
+A/B against the defaults or to debug.
+
+| Variable              | Effect                                                                     |
+| --------------------- | -------------------------------------------------------------------------- |
+| `MELODIE_NO_Q8=1`     | depth decoder back to dense bf16 instead of Q8_0 (by-ear A/B; ~11% slower) |
+| `MELODIE_CODEC_F32=1` | codec DiT back to f32 (by-ear A/B; same speed, ~1.5 GB more resident)      |
+| `MELODIE_PROFILE=1`   | per-frame LM timing summary on stdout                                      |
+| `MELODIE_MODELS_DIR`  | target dir of `just fetch-models` (default `data/models`)                  |
+
+Deeper debug switches (numerics hunts, not for normal use): `MELODIE_PROF2`
+(synced per-frame breakdown), `MELODIE_CPU_SAMPLE` (scalar CPU sampling path),
+`MELODIE_DBG` (layer-activation stats), `MELODIE_NOTOPK` (skip top-k, diagnostic),
+`MELODIE_DECODE_CH` / `MELODIE_DECODE_R` (codec streaming-decode chunk/context).
+
 ## Dev
 
 ```bash
 cp .env.example .env
 just check        # cargo check across the workspace
-just run          # run just the API
-just dev          # api + web in parallel
+just dev          # api + web in parallel (HMR; engine deps built optimized)
+just live         # prod build + one-shot cloudflared tunnel (see below)
 ```
 
 ## Going live

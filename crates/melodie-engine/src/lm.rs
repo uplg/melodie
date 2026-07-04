@@ -99,14 +99,40 @@ fn rmsnorm(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
     )?)
 }
 
-struct Lin(Linear);
+enum Lin {
+    Dense(Linear),
+    /// Q8_0-quantised weight (depth decoder + projection on Metal only; CPU stays
+    /// Dense f32 for bit-exact parity). ~2× less weight bandwidth than bf16 on the
+    /// path that re-reads its 0.62 GB EIGHT times per frame.
+    Q8(candle_core::quantized::QMatMul),
+}
 impl Lin {
     fn load(w: &LmWeights, key: &str) -> Result<Self> {
-        Ok(Self(Linear::new(w.t(&format!("{key}.weight"))?, None)))
+        Ok(Self::Dense(Linear::new(
+            w.t(&format!("{key}.weight"))?,
+            None,
+        )))
+    }
+    /// Quantise the (bf16-rounded) weight to Q8_0 on its device.
+    fn load_q8(w: &LmWeights, key: &str) -> Result<Self> {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        let raw = w.t(&format!("{key}.weight"))?.to_dtype(DType::F32)?;
+        let qt = QTensor::quantize(&raw, GgmlDType::Q8_0)?;
+        Ok(Self::Q8(QMatMul::from_qtensor(qt)?))
+    }
+    fn load_maybe_q8(w: &LmWeights, key: &str, quant: bool) -> Result<Self> {
+        if quant {
+            Self::load_q8(w, key)
+        } else {
+            Self::load(w, key)
+        }
     }
     /// f32 head projection (bf16-rounded weight), runs on the f32 transformer output.
     fn load_head(w: &LmWeights, key: &str) -> Result<Self> {
-        Ok(Self(Linear::new(w.t_head(&format!("{key}.weight"))?, None)))
+        Ok(Self::Dense(Linear::new(
+            w.t_head(&format!("{key}.weight"))?,
+            None,
+        )))
     }
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
         // Collapse [B,S,D] -> [B*S,D] so candle issues ONE 2D gemm (weight read once)
@@ -121,22 +147,47 @@ impl Lin {
         }
     }
     fn fwd2d(&self, x: &Tensor) -> Result<Tensor> {
-        // The decode hot path is M=2 (CFG cond+uncond, S=1). candle's Metal backend only
-        // dispatches its MLX gemv kernel for M==1; M=2 falls onto the tiled gemm, which
-        // measures ~82–124 GB/s on these skinny shapes vs ~150–290 GB/s for TWO gemv
-        // calls (bench: [3072x8192] bf16 0.407 ms gemm vs 0.173 ms for both gemvs, even
-        // though the weight is read twice). So split M=2 into per-row gemvs on Metal.
-        // bf16 only: the f32 heads measured FASTER as one M=2 gemm (247 vs 201 GB/s).
-        // Metal only: keeps the CPU parity path on its exact original kernel.
-        if matches!(x.dims2(), Ok((2, _)))
-            && x.dtype() == DType::BF16
-            && matches!(x.device(), Device::Metal(_))
-        {
-            let y0 = self.0.forward(&x.narrow(0, 0, 1)?)?;
-            let y1 = self.0.forward(&x.narrow(0, 1, 1)?)?;
-            return Ok(Tensor::cat(&[&y0, &y1], 0)?);
+        match self {
+            // The decode hot path is M=2 (CFG cond+uncond, S=1). candle's Metal backend
+            // only dispatches its MLX gemv kernel for M==1; M=2 falls onto the tiled
+            // gemm, which measures ~82–124 GB/s on these skinny shapes vs ~150–290 GB/s
+            // for TWO gemv calls (bench: [3072x8192] bf16 0.407 ms gemm vs 0.173 ms for
+            // both gemvs, even though the weight is read twice). So split M=2 into
+            // per-row gemvs on Metal. bf16 only: the f32 heads measured FASTER as one
+            // M=2 gemm (247 vs 201 GB/s). Metal only: keeps CPU parity on its kernel.
+            Self::Dense(l) => {
+                if matches!(x.dims2(), Ok((2, _)))
+                    && x.dtype() == DType::BF16
+                    && matches!(x.device(), Device::Metal(_))
+                {
+                    let y0 = l.forward(&x.narrow(0, 0, 1)?)?;
+                    let y1 = l.forward(&x.narrow(0, 1, 1)?)?;
+                    return Ok(Tensor::cat(&[&y0, &y1], 0)?);
+                }
+                Ok(l.forward(x)?)
+            }
+            // Quantized: same M=1-only routing quirk — candle picks the fast `mv`
+            // kernel only when the row count is exactly 1 (the `mm` path has
+            // alignment constraints and is slow for skinny M). Feed rows one at a
+            // time for the small Ms this path sees (1, 2, or 4 at the seed step).
+            // The kernel takes f32 in/out; cast from/to the bf16 activations.
+            Self::Q8(qm) => {
+                let (m, _) = x.dims2()?;
+                let dt = x.dtype();
+                let xf = x.to_dtype(DType::F32)?;
+                let y = if m == 1 {
+                    qm.forward(&xf)?
+                } else if m <= 8 {
+                    let rows = (0..m)
+                        .map(|i| qm.forward(&xf.narrow(0, i, 1)?))
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                    Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
+                } else {
+                    qm.forward(&xf)?
+                };
+                Ok(y.to_dtype(dt)?)
+            }
         }
-        Ok(self.0.forward(x)?)
     }
 }
 
@@ -214,12 +265,12 @@ struct Attn {
     head_dim: usize,
 }
 impl Attn {
-    fn load(w: &LmWeights, prefix: &str, f: &LlamaFlavor) -> Result<Self> {
+    fn load(w: &LmWeights, prefix: &str, f: &LlamaFlavor, quant: bool) -> Result<Self> {
         Ok(Self {
-            q: Lin::load(w, &format!("{prefix}.q_proj"))?,
-            k: Lin::load(w, &format!("{prefix}.k_proj"))?,
-            v: Lin::load(w, &format!("{prefix}.v_proj"))?,
-            o: Lin::load(w, &format!("{prefix}.output_proj"))?,
+            q: Lin::load_maybe_q8(w, &format!("{prefix}.q_proj"), quant)?,
+            k: Lin::load_maybe_q8(w, &format!("{prefix}.k_proj"), quant)?,
+            v: Lin::load_maybe_q8(w, &format!("{prefix}.v_proj"), quant)?,
+            o: Lin::load_maybe_q8(w, &format!("{prefix}.output_proj"), quant)?,
             n_heads: f.num_heads,
             n_kv: f.num_kv_heads,
             head_dim: f.head_dim,
@@ -315,11 +366,11 @@ struct Mlp {
     w3: Lin,
 }
 impl Mlp {
-    fn load(w: &LmWeights, prefix: &str) -> Result<Self> {
+    fn load(w: &LmWeights, prefix: &str, quant: bool) -> Result<Self> {
         Ok(Self {
-            w1: Lin::load(w, &format!("{prefix}.w1"))?,
-            w2: Lin::load(w, &format!("{prefix}.w2"))?,
-            w3: Lin::load(w, &format!("{prefix}.w3"))?,
+            w1: Lin::load_maybe_q8(w, &format!("{prefix}.w1"), quant)?,
+            w2: Lin::load_maybe_q8(w, &format!("{prefix}.w2"), quant)?,
+            w3: Lin::load_maybe_q8(w, &format!("{prefix}.w3"), quant)?,
         })
     }
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
@@ -335,12 +386,12 @@ struct Layer {
     eps: f64,
 }
 impl Layer {
-    fn load(w: &LmWeights, prefix: &str, f: &LlamaFlavor, eps: f64) -> Result<Self> {
+    fn load(w: &LmWeights, prefix: &str, f: &LlamaFlavor, eps: f64, quant: bool) -> Result<Self> {
         Ok(Self {
             sa_norm: w.t(&format!("{prefix}.sa_norm.scale"))?,
-            attn: Attn::load(w, &format!("{prefix}.attn"), f)?,
+            attn: Attn::load(w, &format!("{prefix}.attn"), f, quant)?,
             mlp_norm: w.t(&format!("{prefix}.mlp_norm.scale"))?,
-            mlp: Mlp::load(w, &format!("{prefix}.mlp"))?,
+            mlp: Mlp::load(w, &format!("{prefix}.mlp"), quant)?,
             eps,
         })
     }
@@ -373,9 +424,10 @@ impl Transformer {
         f: &LlamaFlavor,
         cfg: &HeartMuLaConfig,
         dev: &Device,
+        quant: bool,
     ) -> Result<Self> {
         let layers = (0..f.num_layers)
-            .map(|i| Layer::load(w, &format!("{prefix}.layers.{i}"), f, cfg.norm_eps))
+            .map(|i| Layer::load(w, &format!("{prefix}.layers.{i}"), f, cfg.norm_eps, quant))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers,
@@ -576,12 +628,17 @@ impl HeartMuLaLm {
             .map(|c| (c * cfg.audio_vocab_size) as f32)
             .collect();
         let cb_offsets = Tensor::from_vec(offsets, (1, 1, cfg.audio_num_codebooks), dev)?;
+        // Q8_0 for the depth decoder + projection: they are re-read 8×/frame, so weight
+        // bandwidth dominates; Q8 halves it vs bf16. Metal only — the CPU path stays
+        // dense f32 so parity examples remain bit-exact. `MELODIE_NO_Q8=1` opts out
+        // (A/B listening: Q8 rounds the decoder's logits slightly).
+        let q8 = matches!(dev, Device::Metal(_)) && std::env::var("MELODIE_NO_Q8").is_err();
         Ok(Self {
-            backbone: Transformer::load(w, "backbone", &cfg.backbone, &cfg, dev)?,
-            decoder: Transformer::load(w, "decoder", &cfg.decoder, &cfg, dev)?,
+            backbone: Transformer::load(w, "backbone", &cfg.backbone, &cfg, dev, false)?,
+            decoder: Transformer::load(w, "decoder", &cfg.decoder, &cfg, dev, q8)?,
             text_embeddings: w.t("text_embeddings.weight")?,
             audio_embeddings: w.t("audio_embeddings.weight")?,
-            projection: Lin::load(w, "projection")?,
+            projection: Lin::load_maybe_q8(w, "projection", q8)?,
             codebook0_head: Lin::load_head(w, "codebook0_head")?,
             audio_head: w.t_head("audio_head")?,
             muq_bias: w.t("muq_linear.bias")?,

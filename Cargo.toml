@@ -56,3 +56,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 opt-level = 3
+
+# Dev builds: optimize all DEPENDENCIES — candle is unusably slow at opt-level 0
+# (the engine's whole compute stack lives in deps) — while the workspace crates
+# stay unoptimized for fast incremental compiles and accurate debugging.
+[profile.dev.package."*"]
+opt-level = 3
