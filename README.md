@@ -51,10 +51,7 @@ just fetch-models   # → data/models/ (override with MELODIE_MODELS_DIR)
 ```
 
 `.env.example` already points `MELODIE_LM_DIR`, `MELODIE_CODEC_DIR` and
-`MELODIE_TOKENIZER` at `data/models/`. If you already have the checkpoints
-(e.g. `heartlib-mlx`'s `ckpt/`), skip the download and point those three vars
-at the existing directories instead — the files are byte-identical to what
-`hf download` fetches.
+`MELODIE_TOKENIZER` at `data/models/`.
 
 ## Dev
 
