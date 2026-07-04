@@ -1,5 +1,4 @@
-//! Static model configuration, ported from `../heartlib-mlx`
-//! (`configuration_heartmula.py`, `configuration_heartcodec.py`, `gen_config.json`).
+//! Static model configuration for HeartMuLa / HeartCodec.
 //!
 //! Values are the `FLAVORS` / dataclass defaults for the `HeartMuLa-oss-3B`
 //! checkpoint; the real `config.json` is filtered against these at load time.
@@ -19,7 +18,7 @@ pub struct LlamaFlavor {
 }
 
 impl LlamaFlavor {
-    /// `llama-3B` temporal backbone — configuration_heartmula.py:53-60.
+    /// `llama-3B` temporal backbone.
     pub fn backbone_3b() -> Self {
         Self {
             num_layers: 28,
@@ -32,7 +31,7 @@ impl LlamaFlavor {
         }
     }
 
-    /// `llama-300M` depth/"sub" decoder — configuration_heartmula.py:61-68.
+    /// `llama-300M` depth/"sub" decoder.
     /// Note the unusually large head_dim (3072/8 = 384); RoPE is built for it.
     pub fn decoder_300m() -> Self {
         Self {
@@ -47,7 +46,7 @@ impl LlamaFlavor {
     }
 }
 
-/// HeartMuLa LM config (the RQ-Transformer wrapper) — configuration_heartmula.py:17-49.
+/// HeartMuLa LM config (the RQ-Transformer wrapper).
 #[derive(Debug, Clone)]
 pub struct HeartMuLaConfig {
     pub backbone: LlamaFlavor,
@@ -84,7 +83,7 @@ impl Default for HeartMuLaConfig {
     }
 }
 
-/// Residual-VQ used by HeartCodec for the conditioning codes — configuration_heartcodec.py:18-25.
+/// Residual-VQ used by HeartCodec for the conditioning codes.
 #[derive(Debug, Clone)]
 pub struct RvqConfig {
     pub num_quantizers: usize, // 8
@@ -93,7 +92,7 @@ pub struct RvqConfig {
     pub dim: usize,            // 512 (project_out target)
 }
 
-/// DiT flow-matching estimator — configuration_heartcodec.py:26-34, transformer.py.
+/// DiT flow-matching estimator.
 #[derive(Debug, Clone)]
 pub struct DitConfig {
     pub num_layers_stage1: usize, // 24
@@ -107,7 +106,7 @@ pub struct DitConfig {
     pub norm_eps: f64,            // 1e-6
 }
 
-/// HeartCodec config — configuration_heartcodec.py:17-49, modeling_heartcodec.py.
+/// HeartCodec config.
 #[derive(Debug, Clone)]
 pub struct HeartCodecConfig {
     pub sample_rate: usize,       // 48000
@@ -159,7 +158,7 @@ impl Default for HeartCodecConfig {
     }
 }
 
-/// Special token IDs — `gen_config.json` / HeartMuLaGenConfig (music_generation.py:31-34).
+/// Special token IDs (from the model's generation config).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenConfig {
     pub text_bos_id: u32,  // 128000

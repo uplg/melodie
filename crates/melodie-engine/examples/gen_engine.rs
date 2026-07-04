@@ -5,10 +5,9 @@ use std::path::PathBuf;
 
 use melodie_engine::{Engine, EngineConfig, GenOptions, Result};
 
-const CKPT: &str = "/Users/leonard/Github/heartlib-mlx/ckpt";
-const LYRICS_FILE: &str = "crates/melodie-engine/reference/lyrics_input.txt";
-const TAGS: &str =
-    "french chanson, male vocal, upbeat feel-good pop, acoustic guitar, brass, 1960s";
+const CKPT: &str = "/Users/leonard/Github/melodie/data";
+const LYRICS_FILE: &str = "crates/melodie-engine/examples/lyrics_input.txt";
+const TAGS: &str = "indie pop, acoustic, warm vocal, gentle, organic, hand claps, ukulele, 100bpm";
 
 fn main() -> Result<()> {
     let frames: usize = std::env::args()

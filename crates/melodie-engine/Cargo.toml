@@ -7,8 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Local HeartMuLa inference engine (pure-Rust, candle) — Mélodie's music
-# generator. Ported from ../heartlib-mlx (HeartMuLa LM + HeartCodec).
+# Local HeartMuLa inference engine (pure-Rust, candle) — Mélodie's music generator.
 # See crate docs (src/lib.rs) for the phased port plan.
 
 [dependencies]

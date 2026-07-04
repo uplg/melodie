@@ -131,7 +131,7 @@ impl Engine {
         Self::load_on(cfg, dev)
     }
 
-    /// Load on a caller-chosen device (used by tests / CPU parity).
+    /// Load on a caller-chosen device (used by tests / the CPU path).
     pub fn load_on(cfg: &EngineConfig, dev: Device) -> Result<Self> {
         let tok = load_tokenizer(path_str(&cfg.tokenizer_path)?)?;
         let lm = {
@@ -218,7 +218,6 @@ impl Engine {
             };
             self.codec.detokenize(
                 &codes.unsqueeze(0)?,
-                None,
                 self.codec_cfg.segment_duration,
                 self.codec_cfg.flow_num_steps,
                 self.codec_cfg.flow_guidance_scale,
@@ -296,7 +295,6 @@ impl Engine {
             };
             self.codec.detokenize(
                 &codes.unsqueeze(0)?,
-                None,
                 self.codec_cfg.segment_duration,
                 self.codec_cfg.flow_num_steps,
                 self.codec_cfg.flow_guidance_scale,

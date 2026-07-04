@@ -1,9 +1,8 @@
-//! End-to-end generation pipeline: lyrics + style → token grid. **PHASE 3.**
+//! End-to-end generation pipeline: lyrics + style → token grid.
 //!
-//! Ported from `pipelines/music_generation.py` `preprocess`. Tokenizes the style
-//! tags and lyrics with the Llama-3 tokenizer and builds the 9-channel token grid
-//! the LM consumes (text in the last channel, audio channels empty, a single MuQ
-//! slot between tags and lyrics).
+//! Tokenizes the style tags and lyrics with the Llama-3 tokenizer and builds the
+//! 9-channel token grid the LM consumes (text in the last channel, audio channels
+//! empty, a single MuQ slot between tags and lyrics).
 
 use candle_core::{Device, Tensor};
 use tokenizers::Tokenizer;
@@ -41,7 +40,6 @@ fn encode(tok: &Tokenizer, s: &str, gcfg: &GenConfig) -> Result<Vec<i64>> {
 }
 
 /// Build the prompt from `tags` (style, e.g. "french chanson, male vocal") and `lyrics`.
-/// Mirrors `HeartMuLaGenPipeline.preprocess` (music_generation.py:66-147).
 pub fn preprocess(
     tok: &Tokenizer,
     gcfg: &GenConfig,

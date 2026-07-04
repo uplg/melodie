@@ -1,11 +1,10 @@
-//! HeartCodec decoder: discrete codes → 48 kHz waveform. **PHASE 1.**
+//! HeartCodec decoder: discrete codes → 48 kHz waveform.
 //!
-//! Ported from `heartcodec/{modeling_heartcodec.py, flow_matching.py, sq_codec.py}`.
-//! This file currently implements the **ScalarModel decoder** (latent → waveform),
-//! the pure-conv vocoder half. The RVQ + DiT flow-matching half is P1b-next.
+//! This file implements the **ScalarModel decoder** (latent → waveform), the
+//! pure-conv vocoder half; the RVQ + DiT flow-matching half lives in [`crate::flow`].
 //!
-//! Layout note: the MLX reference works in (N, L, C); candle (like PyTorch) works
-//! in (N, C, L). We load the **original PyTorch** weights — conv `(out,in,k)` and
+//! Layout note: HeartCodec works in (N, L, C); candle (like PyTorch) works in
+//! (N, C, L). We load the **original PyTorch** weights — conv `(out,in,k)` and
 //! conv-transpose `(in,out,k)` match candle exactly, so **no weight transpose** is
 //! needed; we only fuse weight-norm at load time.
 
@@ -71,7 +70,7 @@ impl CodecWeights {
 }
 
 // ---------------------------------------------------------------------------
-// conv primitives (NCL), matching sq_codec.py semantics
+// conv primitives (NCL)
 // ---------------------------------------------------------------------------
 
 fn conv1d(
@@ -177,9 +176,10 @@ fn zero_stuff_time(x: &Tensor, stride: usize) -> Result<Tensor> {
 }
 
 /// Transposed conv written out explicitly (zero-stuff by `stride`, full-pad, then
-/// cross-correlate with the flipped kernel). Equivalent to candle's built-in
-/// `conv_transpose1d` (which is itself PyTorch-correct); kept in this explicit form
-/// because it is verified bit-for-bit against the MLX reference across the decoder.
+/// cross-correlate with the flipped kernel). Mathematically equal to candle's built-in
+/// `conv_transpose1d`, but kept in this explicit form to sidestep a candle
+/// `ConvTranspose1d` batch bug (garbage output for batch elements ≥ 1, and the codec
+/// runs the two stereo channels as a batch of 2).
 /// `w_inok` is `(in,out,k)`; output is causally trimmed of its last `stride` samples.
 fn conv_transpose1d_causal_manual(
     x: &Tensor,
@@ -215,8 +215,7 @@ fn flip_last_dim(w: &Tensor) -> Result<Tensor> {
     Ok(w.index_select(&idx, 2)?)
 }
 
-/// Row vector `linspace(0, 1, n)` of shape `(1, n)` — the overlap-add crossfade
-/// window (`mx.linspace(0,1,ovlp)[None, :]` in modeling_heartcodec.py:175).
+/// Row vector `linspace(0, 1, n)` of shape `(1, n)` — the overlap-add crossfade window.
 fn linspace01_row(n: usize, dev: &Device) -> Result<Tensor> {
     let denom = (n.max(2) - 1) as f32; // n>=2 in practice; guard n==1 against /0
     let v: Vec<f32> = (0..n).map(|i| i as f32 / denom).collect();
@@ -263,7 +262,7 @@ struct ResDecoderBlock {
 
 impl ResDecoderBlock {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // explicit transposed-conv form (verified against the MLX golden)
+        // explicit transposed-conv form (works around the candle batch bug, see above)
         let mut x = conv_transpose1d_causal_manual(x, &self.up_w, &self.up_b, self.stride)?;
         for u in &self.units {
             x = u.forward(&x)?;
@@ -349,17 +348,12 @@ impl ScalarDecoder {
         })
     }
 
-    /// Decode a latent `(N, L, 128)` (MLX-layout, as dumped) → waveform `(N, L*1920)`.
-    /// Decode `(N, L, C)` → `(N, L*1920)`. Each batch item (e.g. the two stereo channels)
-    /// is decoded independently and synchronized, so the ×1920 conv working set is bounded
-    /// to ONE item — roughly halving the decode's peak GPU residency vs the batched form,
-    /// which keeps long songs inside this Mac's memory budget. The conv stack is
-    /// batch-independent, so this is bit-identical to decoding the full batch at once.
-    /// Decode `(N, L, C)` → `(N, L*1920)` via the full-stack streaming pass (`decode_streaming`):
-    /// the whole stereo batch in one go, chunked along time. Verified **bit-identical** to a
-    /// dense decode for `R ≥ 48` (the conv stack's receptive span — see `parity_scalar`'s
-    /// self-parity sweep). The defaults keep a safety margin and bound the chunk so the batched
-    /// decode fits the GPU; both are env-overridable for tuning.
+    /// Decode a latent `(N, L, C)` → waveform `(N, L*1920)` via the full-stack streaming
+    /// pass (`decode_streaming`): the whole stereo batch in one go, chunked along time.
+    /// Chunking bounds the ×1920 conv working set so long songs stay inside this Mac's
+    /// memory budget; it is **bit-identical** to a dense decode for `R ≥ 48` (the conv
+    /// stack's receptive span). The defaults keep a safety margin and bound the chunk so
+    /// the decode fits the GPU; both are env-overridable for tuning.
     pub fn decode(&self, latent_nlc: &Tensor) -> Result<Tensor> {
         // Large chunk + minimal context (≈ the ~48-frame receptive span, +margin) keeps the
         // re-decoded overlap small while still bounding the batched activations.
@@ -416,29 +410,10 @@ impl ScalarDecoder {
         // (1, 1, L) → (1, L)
         Ok(x.squeeze(1)?)
     }
-
-    /// Like [`decode`], but returns the NCL output of each decoder stage
-    /// (conv0, blocks 0..4, postprocessor, final conv) for parity localisation.
-    pub fn decode_tapped(&self, latent_nlc: &Tensor) -> Result<Vec<Tensor>> {
-        let x = latent_nlc.transpose(1, 2)?.contiguous()?;
-        let x = round9(&x)?;
-        let mut taps = Vec::new();
-        let mut x = conv1d(&x, &self.conv0_w, &self.conv0_b, false, 1, 1)?;
-        taps.push(x.clone()); // dec0
-        for blk in &self.blocks {
-            x = blk.forward(&x)?;
-            taps.push(x.clone()); // dec1..dec5
-        }
-        x = self.post.forward(&x)?;
-        taps.push(x.clone()); // dec6
-        x = conv1d(&x, &self.conv7_w, &self.conv7_b, true, 1, 1)?;
-        taps.push(x.clone()); // dec7
-        Ok(taps)
-    }
 }
 
 // ---------------------------------------------------------------------------
-// top-level (FM half still TODO)
+// top-level
 // ---------------------------------------------------------------------------
 
 /// HeartCodec: FlowMatching (codes→latent) + ScalarModel (latent→waveform).
@@ -455,43 +430,19 @@ impl HeartCodec {
         })
     }
 
-    /// Decode one segment: codes `(1,Q,T)` + initial `noise` `(1,2T,256)` → waveform `(2, 2T*1920)`.
-    /// (Single-segment path; multi-segment overlap-add is layered on top later.)
-    pub fn detokenize_segment(
-        &self,
-        codes: &Tensor,
-        noise: &Tensor,
-        num_steps: usize,
-        gs: f64,
-    ) -> Result<Tensor> {
-        let fm_latents = self.fm.inference(codes, noise, num_steps, gs)?; // (1,2T,256)
-        let (b, t2, f) = fm_latents.dims3()?;
-        // reshape (B,2T,256) -> (B,2T,2,128) -> (B,2,2T,128) -> (2B,2T,128)  (modeling_heartcodec.py:184-186)
-        let latent = fm_latents
-            .reshape((b, t2, 2, f / 2))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()?
-            .reshape((b * 2, t2, f / 2))?;
-        self.scalar.decode(&latent) // (2, 2T*1920)
-    }
-
-    /// Full multi-segment detokenize — port of `HeartCodec.detokenize`
-    /// (modeling_heartcodec.py:76-223). Pads codes to a whole number of
+    /// Full multi-segment detokenize. Pads codes to a whole number of
     /// `duration`-second segments, flow-matches each segment (carrying the previous
     /// segment's tail as in-context latents), ScalarModel-decodes, then linearly
     /// crossfades the segments together (overlap-add) and trims to the original length.
     ///
-    /// `codes` is `(1, Q, T)`. `fm_noise` (optional) injects the **first** segment's
-    /// initial latent `(1, 2*min_samples, 256)` for deterministic parity; when `None`
-    /// every segment's latent (and the in-context random pad) is drawn with `randn` —
-    /// matching the reference, which draws all randomness internally.
+    /// `codes` is `(1, Q, T)`; every segment's latent (and the in-context random pad)
+    /// is drawn with `randn`.
     ///
     /// `on_seg`, if set, is called `(segments_done, total_segments)` as each segment's
     /// decode finishes — purely for progress reporting; it has no numerical effect.
     pub fn detokenize(
         &self,
         codes: &Tensor,
-        fm_noise: Option<&Tensor>,
         duration: f64,
         num_steps: usize,
         gs: f64,
@@ -499,7 +450,7 @@ impl HeartCodec {
     ) -> Result<Tensor> {
         let dev = codes.device();
 
-        // --- segmentation constants (modeling_heartcodec.py:101-123) ---
+        // --- segmentation constants ---
         let min_samples = (duration * 12.5) as usize; // codes/segment (372 @ 29.76)
         let hop_samples = min_samples / 93 * 80; //                    (320)
         let ovlp_samples = min_samples - hop_samples; // codes overlap (52)
@@ -511,7 +462,7 @@ impl HeartCodec {
         let codes_len0 = codes.dim(2)?;
         let target_len = (codes_len0 as f64 / 12.5 * sample_rate as f64) as usize;
 
-        // --- pad codes (modeling_heartcodec.py:108-122) ---
+        // --- pad codes ---
         let mut codes = codes.clone();
         if codes.dim(2)? < min_samples {
             while codes.dim(2)? < min_samples {
@@ -520,9 +471,9 @@ impl HeartCodec {
             codes = codes.narrow(2, 0, min_samples)?;
         }
         let codes_len = codes.dim(2)?;
-        // Reference `(codes_len - ovlp_frames) % hop_samples > 0` (codes not segment-aligned).
+        // Realign when `(codes_len - ovlp_frames) % hop_samples > 0` (codes not segment-aligned).
         if !(codes_len - ovlp_frames).is_multiple_of(hop_samples) {
-            // NB: condition uses `ovlp_frames`, formula uses `ovlp_samples` (verbatim).
+            // NB: the condition uses `ovlp_frames` while the formula uses `ovlp_samples`.
             let len_codes = ((codes_len - ovlp_samples) as f64 / hop_samples as f64).ceil()
                 as usize
                 * hop_samples
@@ -547,15 +498,15 @@ impl HeartCodec {
             None
         };
 
-        // --- interleaved segment loop (modeling_heartcodec.py:126-223) ---
+        // --- interleaved segment loop ---
         // CRITICAL ordering: decode each segment IMMEDIATELY after its flow-matching pass,
-        // then synchronize() to free the GPU, before moving to the next segment. The
-        // reference (and the first port) ran ALL FM passes first and ALL decodes second; on
-        // Metal that leaves every segment's FM residency live when the first decode runs, so
-        // the decode's ×1920 working set tips over the GPU budget → OOM (localised to
-        // `decode segment 0`). Interleaving keeps each segment's peak identical to a verified
-        // single-segment decode, so songs of any length stay bounded. Only the previous
-        // segment's latent is needed (for the in-context prefix), so we carry just that.
+        // then synchronize() to free the GPU, before moving to the next segment. An earlier
+        // version ran ALL FM passes first and ALL decodes second; on Metal that leaves every
+        // segment's FM residency live when the first decode runs, so the decode's ×1920
+        // working set tips over the GPU budget → OOM (localised to `decode segment 0`).
+        // Interleaving keeps each segment's peak identical to a single-segment decode, so
+        // songs of any length stay bounded. Only the previous segment's latent is needed
+        // (for the in-context prefix), so we carry just that.
         let mut prev_latent: Option<Tensor> = None;
         let mut output: Option<Tensor> = None;
         let mut sinx = 0usize;
@@ -564,12 +515,9 @@ impl HeartCodec {
         while sinx + hop_samples <= total {
             let codes_input = codes.narrow(2, sinx, min_samples)?; // (1,Q,min_samples)
             let latents = if sinx == 0 || ovlp_frames == 0 {
-                // First segment: incontext_length = 0 (true_latents unused; the
-                // reference's `first_latent` randn only matters for its RNG draw).
-                let noise = match fm_noise {
-                    Some(n) if sinx == 0 => n.clone(),
-                    _ => Tensor::randn(0f32, 1f32, (1, 2 * min_samples, 256), dev)?,
-                };
+                // First segment: incontext_length = 0, so true_latents is unused
+                // (first_latent's randn only matters for RNG draw ordering).
+                let noise = Tensor::randn(0f32, 1f32, (1, 2 * min_samples, 256), dev)?;
                 let first_latent = Tensor::randn(0f32, 1f32, (1, latent_length, 256), dev)?;
                 let ctx = SegmentCtx {
                     true_latents: &first_latent,

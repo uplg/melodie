@@ -1,12 +1,12 @@
-//! HeartCodec FlowMatching DiT (the transformer half of the codec). **P1b.**
+//! HeartCodec FlowMatching DiT (the transformer half of the codec).
 //!
-//! Ported from `heartcodec/models/{flow_matching.py, transformer.py}`. The DiT
-//! ("estimator") is a two-stage PixArt-style transformer with AdaLayerNorm-single
-//! timestep conditioning, interleaved RoPE, and SwiGLU MLP. All weights are plain
-//! (no weight-norm); conv `(out,in,k)` and linear `(out,in)` match candle directly.
+//! The DiT ("estimator") is a two-stage PixArt-style transformer with
+//! AdaLayerNorm-single timestep conditioning, interleaved RoPE, and SwiGLU MLP.
+//! All weights are plain (no weight-norm); conv `(out,in,k)` and linear `(out,in)`
+//! match candle directly.
 //!
-//! Layout: the reference runs in (B,T,C); we keep (B,T,C) here and only drop to
-//! (B,C,T) inside the ProjectLayer convs.
+//! Layout: everything runs in (B,T,C); we only drop to (B,C,T) inside the
+//! ProjectLayer convs.
 
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Linear, Module};
@@ -21,7 +21,7 @@ fn silu(x: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::ops::silu(x)?)
 }
 
-/// RMSNorm with weight, eps (matches mlx nn.RMSNorm).
+/// RMSNorm with weight, eps.
 fn rmsnorm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     // candle's fused RMSNorm kernel (1 Metal launch vs ~6 hand-rolled ops); the
     // reduction runs in f32 — the DiT is f32 throughout, so numerics are unchanged.
@@ -30,7 +30,7 @@ fn rmsnorm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 
 /// Parameter-free LayerNorm (elementwise_affine=False): (x-mean)/sqrt(var+eps).
 /// The reduction runs in f32 even for bf16 inputs (mean/var in bf16 lose ~3 digits);
-/// on the f32 path the upcasts are no-ops, so parity is unchanged.
+/// on the f32 path the upcasts are no-ops, so numerics are unchanged.
 fn layernorm_free(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let x = x.to_dtype(DType::F32)?;
@@ -59,7 +59,7 @@ impl Lin {
     }
 }
 
-/// ProjectLayer: Conv1d(k) → *k^-0.5 → Linear (transformer.py:248-270).
+/// ProjectLayer: Conv1d(k) → *k^-0.5 → Linear.
 struct ProjectLayer {
     conv_w: Tensor,
     conv_b: Tensor,
@@ -90,7 +90,7 @@ impl ProjectLayer {
 
 // --- RoPE (interleaved) --------------------------------------------------
 
-/// cos/sin tables of shape (T, dim/2), base 10000 (transformer.py:20-28).
+/// cos/sin tables of shape (T, dim/2), base 10000.
 fn rope_tables(t: usize, dim: usize, base: f64, dev: &Device) -> Result<(Tensor, Tensor)> {
     let half = dim / 2;
     let inv: Vec<f32> = (0..half)
@@ -103,9 +103,9 @@ fn rope_tables(t: usize, dim: usize, base: f64, dev: &Device) -> Result<(Tensor,
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
-/// Apply interleaved RoPE to (B,H,T,D) with cos/sin (T,D/2) (transformer.py:31-64).
-/// Same math as the reference's hand-rolled form (even/odd pairs, x1·cos−x2·sin /
-/// x1·sin+x2·cos) but via candle's fused kernel: 1 launch vs ~10.
+/// Apply interleaved RoPE to (B,H,T,D) with cos/sin (T,D/2). Same math as the
+/// hand-rolled even/odd form (x1·cos−x2·sin / x1·sin+x2·cos) but via candle's
+/// fused kernel: 1 launch vs ~10.
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::rotary_emb::rope_i(&x.contiguous()?, cos, sin)?)
 }
@@ -239,7 +239,7 @@ impl Block {
 
 // --- timestep / AdaLN-single --------------------------------------------
 
-/// Sinusoidal timestep embedding (transformer.py:297-308). t: (B,), out (B, dim).
+/// Sinusoidal timestep embedding. t: (B,), out (B, dim).
 fn timestep_sinusoid(t: &Tensor, dim: usize, dev: &Device) -> Result<Tensor> {
     let half = dim / 2;
     let max_period = 10000.0f64;
@@ -313,7 +313,7 @@ pub struct Dit {
     /// Compute dtype: bf16 on Metal by default — speed-neutral on M1 Max (the
     /// estimator's gemms are large-M compute-bound) but ~1.5 GB less resident
     /// weight memory. `MELODIE_CODEC_F32=1` opts back into the f32 numerics for
-    /// A/B listening; CPU is always f32 (bit-exact parity). The Euler solver
+    /// A/B listening; CPU is always f32 (bit-exact). The Euler solver
     /// stays f32 either way — `forward` casts at its boundary.
     dt: DType,
 }
@@ -428,8 +428,7 @@ fn upsample2_time_btc(x: &Tensor) -> Result<Tensor> {
 }
 
 /// In-context conditioning for one [`FlowMatching::inference_codes`] segment
-/// (groups the `true_latents` / `latent_length` / `incontext_length` args of the
-/// reference `flow_matching.py::inference_codes`).
+/// (groups the `true_latents` / `latent_length` / `incontext_length` args).
 pub struct SegmentCtx<'a> {
     /// Context latents `(1, latent_length, 256)`; only the first `incontext_length`
     /// frames are read (the rest are masked to zero, matching `true_latents * mask`).
@@ -437,7 +436,7 @@ pub struct SegmentCtx<'a> {
     /// Valid latent frames for this segment (`== 2*T_codes` in this pipeline).
     pub latent_length: usize,
     /// Leading frames carried over as in-context (`0` ⇒ the in-context branch is inert
-    /// and `inference_codes` reduces exactly to the verified seg0 path).
+    /// and `inference_codes` reduces exactly to the plain seg0 path).
     pub incontext_length: usize,
 }
 
@@ -468,19 +467,17 @@ impl FlowMatching {
         })
     }
 
-    /// In-context-capable flow-matching inference — port of
-    /// `flow_matching.py::inference_codes` (161-252).
+    /// In-context-capable flow-matching inference.
     ///
     /// - `codes` (1,Q,T_codes) integer codes for this segment.
     /// - `ctx` the in-context conditioning ([`SegmentCtx`]): `true_latents`
     ///   (1, latent_length, 256) — only the first `incontext_length` frames are read
-    ///   (the reference zeros the rest via the `mask==1` multiply).
-    /// - `noise` (1, 2*T_codes, 256) the initial latent. The reference draws this
-    ///   with `randn` *inside* `inference_codes`; we take it as an argument so the
-    ///   caller controls randomness (and parity tests can inject a fixed latent).
+    ///   (the rest are zeroed via the `mask==1` multiply).
+    /// - `noise` (1, 2*T_codes, 256) the initial latent, taken as an argument so the
+    ///   caller controls randomness (and can inject a fixed latent for determinism).
     ///
     /// Returns (1, 2*T_codes, 256). With `ctx.incontext_length == 0` the in-context
-    /// branch is inert and this reduces *exactly* to the verified seg0 path.
+    /// branch is inert and this reduces *exactly* to the plain seg0 path.
     pub fn inference_codes(
         &self,
         codes: &Tensor,
@@ -510,12 +507,12 @@ impl FlowMatching {
             .fwd(&self.project_out.fwd(&summed.unwrap())?)?; // (1,T,512)
         // Nearest-neighbour ×2 time upsample → conditioning `mu`.
         //
-        // The reference builds `latent_masks` (=2 where frame<latent_length, else 0;
+        // The full model builds `latent_masks` (=2 where frame<latent_length, else 0;
         // =1 where frame<incontext_length) and zeros `mu` wherever mask==0 (replacing
         // it with `zero_cond_embedding1`, which is all zeros). In this pipeline
         // `latent_length == num_frames == 2*T_codes` always, so the mask is 2 (or 1 in
         // the in-context prefix) everywhere — never 0 — and the conditioning mask is the
-        // identity. `mu` is therefore used in full. (flow_matching.py:203-220)
+        // identity. `mu` is therefore used in full.
         let mu = upsample2_time_btc(&cond)?; // (1,2T,512)
         let num_frames = mu.dim(1)?;
         debug_assert_eq!(
@@ -524,7 +521,7 @@ impl FlowMatching {
         );
 
         // In-context latents = `true_latents * (latent_masks == 1)`: keep the first
-        // `incontext_length` frames, zero the rest (flow_matching.py:222-227). With
+        // `incontext_length` frames, zero the rest. With
         // `latent_length == num_frames`, `incontext_length_actual == incontext_length`.
         let incontext_x = if incontext_length > 0 {
             let kept = true_latents.narrow(1, 0, incontext_length)?; // (1, ic, 256)
@@ -539,7 +536,7 @@ impl FlowMatching {
         };
 
         // Euler ODE solve (with the per-step in-context blend), then restore the
-        // in-context prefix (flow_matching.py:233-250).
+        // in-context prefix.
         let solved = self.solve_euler(noise, &incontext_x, incontext_length, &mu, num_steps, gs)?;
         if incontext_length > 0 {
             let head = incontext_x.narrow(1, 0, incontext_length)?;
@@ -551,7 +548,7 @@ impl FlowMatching {
     }
 
     /// Fixed-step Euler ODE solver with classifier-free guidance and the optional
-    /// in-context blend — port of `flow_matching.py::_solve_euler` (254-312).
+    /// in-context blend.
     ///
     /// `x_init` is the initial latent; it is also the `noise` reference the
     /// in-context blend reads each step. `incontext_length == 0` skips the blend,
@@ -612,25 +609,5 @@ impl FlowMatching {
             x = (x + (dphi * dt)?)?;
         }
         Ok(x)
-    }
-
-    /// `codes` (1,Q,T) integer codes, `noise` (1,2T,256) initial latent.
-    /// Returns fm_latents (1,2T,256). The seg0 path: all frames conditioned,
-    /// `incontext_length=0`, CFG `gs` over `num_steps` Euler steps. Thin wrapper
-    /// over [`Self::inference_codes`].
-    pub fn inference(
-        &self,
-        codes: &Tensor,
-        noise: &Tensor,
-        num_steps: usize,
-        gs: f64,
-    ) -> Result<Tensor> {
-        let num_frames = noise.dim(1)?; // 2T
-        let ctx = SegmentCtx {
-            true_latents: noise,
-            latent_length: num_frames,
-            incontext_length: 0,
-        };
-        self.inference_codes(codes, &ctx, noise, num_steps, gs)
     }
 }

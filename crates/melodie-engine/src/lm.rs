@@ -1,9 +1,8 @@
-//! HeartMuLa LM: RQ-Transformer that emits audio codes. **PHASE 2.**
+//! HeartMuLa LM: RQ-Transformer that emits audio codes.
 //!
-//! Ported from `heartmula/modeling_heartmula.py`. A Llama-3.1 backbone (~3B)
-//! predicts codebook 0 per 12.5 Hz frame; a 300M depth decoder autoregresses
-//! codebooks 1–7. GQA, Llama-3.1 *scaled* RoPE, RMSNorm, SwiGLU. Transformer
-//! outputs are upcast to f32 (else codebooks 1–7 corrupt in bf16).
+//! A Llama-3.1 backbone (~3B) predicts codebook 0 per 12.5 Hz frame; a 300M depth
+//! decoder autoregresses codebooks 1–7. GQA, Llama-3.1 *scaled* RoPE, RMSNorm,
+//! SwiGLU. Transformer outputs are upcast to f32 (else codebooks 1–7 corrupt in bf16).
 //!
 //! candle is NCL/(out,in) like PyTorch, so the original safetensors load with no
 //! transpose; norms are stored as `.scale`.
@@ -25,9 +24,9 @@ pub struct LmWeights {
 }
 impl LmWeights {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
-        // bf16 on Metal (the reference runtime; matmuls are bandwidth-bound on the weights so
-        // bf16 ≈ 2× f32). f32 on CPU — candle's CPU backend has no bf16 matmul, and CPU is
-        // only used for bit-exact parity tests.
+        // bf16 on Metal (matmuls are bandwidth-bound on the weights, so bf16 ≈ 2× f32).
+        // f32 on CPU — candle's CPU backend has no bf16 matmul, and CPU is only used for
+        // deterministic f32 runs / debugging.
         let dtype = if matches!(device, Device::Metal(_)) {
             DType::BF16
         } else {
@@ -66,8 +65,8 @@ impl LmWeights {
         }
     }
     /// Head/output weight: always f32 (runs on the f32-upcast transformer output, else
-    /// codebooks 1-7 corrupt). On Metal, round to bf16 to match the reference (which
-    /// promotes its bf16 weight to f32); on CPU keep raw f32 for bit-exact parity.
+    /// codebooks 1-7 corrupt). On Metal, round-trip through bf16 (the weight ships as
+    /// bf16 and is promoted to f32 at runtime); on CPU keep raw f32.
     fn t_head(&self, key: &str) -> Result<Tensor> {
         let raw = self.raw(key)?;
         if self.dtype == DType::BF16 {
@@ -101,9 +100,9 @@ fn rmsnorm(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
 
 enum Lin {
     Dense(Linear),
-    /// Q8_0-quantised weight (depth decoder + projection on Metal only; CPU stays
-    /// Dense f32 for bit-exact parity). ~2× less weight bandwidth than bf16 on the
-    /// path that re-reads its 0.62 GB EIGHT times per frame.
+    /// Q8_0-quantised weight (depth decoder + projection on Metal only; CPU stays dense
+    /// f32). ~2× less weight bandwidth than bf16 on the path that re-reads its 0.62 GB
+    /// EIGHT times per frame.
     Q8(candle_core::quantized::QMatMul),
 }
 impl Lin {
@@ -149,12 +148,12 @@ impl Lin {
     fn fwd2d(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             // The decode hot path is M=2 (CFG cond+uncond, S=1). candle's Metal backend
-            // only dispatches its MLX gemv kernel for M==1; M=2 falls onto the tiled
+            // only dispatches its gemv kernel for M==1; M=2 falls onto the tiled
             // gemm, which measures ~82–124 GB/s on these skinny shapes vs ~150–290 GB/s
             // for TWO gemv calls (bench: [3072x8192] bf16 0.407 ms gemm vs 0.173 ms for
             // both gemvs, even though the weight is read twice). So split M=2 into
             // per-row gemvs on Metal. bf16 only: the f32 heads measured FASTER as one
-            // M=2 gemm (247 vs 201 GB/s). Metal only: keeps CPU parity on its kernel.
+            // M=2 gemm (247 vs 201 GB/s). Metal only: the CPU path is untouched.
             Self::Dense(l) => {
                 if matches!(x.dims2(), Ok((2, _)))
                     && x.dtype() == DType::BF16
@@ -341,7 +340,7 @@ impl Attn {
             let k = Self::expand_kv(&k, h / nkv)?; // [B,H,Sx,D]
             let v = Self::expand_kv(&v, h / nkv)?;
             let (k, v) = cache.append(&k, &v)?; // [B,H,Skv,D]
-            // CPU (parity only — SDPA has no CPU impl): manual attention with the mask.
+            // CPU path (SDPA has no CPU impl): manual attention with the mask.
             let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? / (dh as f64).sqrt())?;
             let skv = k.dim(2)?;
             let scores = scores.broadcast_add(
@@ -511,8 +510,8 @@ fn causal_mask(s: usize, dev: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(d, (s, s), dev)?)
 }
 
-/// Top-k Gumbel sampling matching `_sample_topk` (modeling_heartmula.py:384-407),
-/// with the uniform draw injected for reproducibility. B=1; returns the token id.
+/// Top-k Gumbel sampling, with the uniform draw injected for reproducibility.
+/// B=1; returns the token id.
 fn sample_topk(logits: &Tensor, topk: usize, temperature: f64, uniform: &Tensor) -> Result<u32> {
     let v: Vec<f32> = logits
         .affine(1.0 / temperature, 0.0)?
@@ -630,7 +629,7 @@ impl HeartMuLaLm {
         let cb_offsets = Tensor::from_vec(offsets, (1, 1, cfg.audio_num_codebooks), dev)?;
         // Q8_0 for the depth decoder + projection: they are re-read 8×/frame, so weight
         // bandwidth dominates; Q8 halves it vs bf16. Metal only — the CPU path stays
-        // dense f32 so parity examples remain bit-exact. `MELODIE_NO_Q8=1` opts out
+        // dense f32. `MELODIE_NO_Q8=1` opts out
         // (A/B listening: Q8 rounds the decoder's logits slightly).
         let q8 = matches!(dev, Device::Metal(_)) && std::env::var("MELODIE_NO_Q8").is_err();
         Ok(Self {
@@ -1143,7 +1142,7 @@ impl HeartMuLaLm {
         let gpu_sample = std::env::var("MELODIE_CPU_SAMPLE").is_err();
         let mut frames: Vec<Vec<u32>> = Vec::new();
         // All-zero generated-frame attention mask, allocated once and narrowed each step
-        // (Metal sdpa ignores it; the CPU parity path adds 0 → no-op). Avoids a fresh
+        // (Metal sdpa ignores it; the CPU path adds 0 → no-op). Avoids a fresh
         // growing `(1, pos+1)` tensor every frame.
         let gen_mask = Tensor::zeros((1, s + max_frames), DType::F32, dev)?;
         // Per-frame constants: depth-loop tensors and the absolute-position ladder,

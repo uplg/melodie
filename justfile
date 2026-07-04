@@ -37,7 +37,7 @@ gate:
 
 # --- Models: fetch the HeartMuLa checkpoints straight from Hugging Face.
 #     curl-only (no Python/hf CLI), resumable, idempotent. ~21 GB total.
-#     The engine reads the original safetensors — no MLX conversion step. ---
+#     The engine reads the original safetensors directly — no conversion step. ---
 
 fetch-models:
     #!/usr/bin/env bash

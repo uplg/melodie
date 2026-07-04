@@ -127,10 +127,10 @@ async fn create(
         }
     }
 
-    // Build the engine tags exactly like the HeartMuLa reference
-    // (`server.py:297-298`): a lowercase, comma-joined, space-free list with the
-    // language first — `"<language>,<style1>,<style2>,…"`. The raw `styles`
-    // string is what we persist as the song's `tags`.
+    // Build the engine tags the way HeartMuLa expects them: a lowercase,
+    // comma-joined, space-free list with the language first —
+    // `"<language>,<style1>,<style2>,…"`. The raw `styles` string is what we
+    // persist as the song's `tags`.
     let language = req.language.trim().to_lowercase();
     let normalized_styles = req
         .styles
