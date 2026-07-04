@@ -20,7 +20,7 @@ fn main() -> Result<()> {
         tokenizer_path: PathBuf::from(format!("{CKPT}/tokenizer.json")),
     };
     println!("loading engine...");
-    let engine = Engine::load(&cfg)?;
+    let mut engine = Engine::load(&cfg)?;
     let lyrics = std::fs::read_to_string(LYRICS_FILE)?; // read locally; never printed
     println!("generating up to {frames} frames...");
     let opts = GenOptions {

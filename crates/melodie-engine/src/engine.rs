@@ -114,13 +114,24 @@ fn wav_err(e: hound::Error) -> EngineError {
 }
 
 /// A loaded HeartMuLa + HeartCodec pipeline pinned to one device.
+///
+/// Generation is single-threaded and mutably borrows the engine (`&mut self`): a caller
+/// owns one `Engine` and drives it sequentially (as `melodie-api`'s worker thread does).
 pub struct Engine {
     tok: Tokenizer,
-    lm: HeartMuLaLm,
+    /// `None` only after an `unload_lm` drop; [`Engine::ensure_lm`] reloads it on demand.
+    lm: Option<HeartMuLaLm>,
     codec: HeartCodec,
     dev: Device,
     gcfg: GenConfig,
     codec_cfg: HeartCodecConfig,
+    /// Checkpoint locations, retained so the LM can be reloaded after an `unload_lm` drop.
+    cfg: EngineConfig,
+    /// When set (`MELODIE_UNLOAD_LM=1`), the LM's ~7.5 GB is dropped from the device after the
+    /// frame loop and before the codec runs, then reloaded lazily on the next generation. Trades
+    /// an LM reload (~15 GB read) per song for ~7.5 GB more headroom during the codec stage —
+    /// worth it on memory-tight machines / occasional generations, not for back-to-back throughput.
+    unload_lm: bool,
 }
 
 impl Engine {
@@ -145,16 +156,31 @@ impl Engine {
         let codec = HeartCodec::load(&cw, &codec_cfg, &dev)?;
         Ok(Self {
             tok,
-            lm,
+            lm: Some(lm),
             codec,
             dev,
             gcfg: GenConfig::default(),
             codec_cfg,
+            cfg: cfg.clone(),
+            unload_lm: std::env::var("MELODIE_UNLOAD_LM").is_ok(),
         })
     }
 
+    /// The LM, reloading its weights from disk if a prior generation unloaded them (see
+    /// [`Engine`]'s `unload_lm`). The reload reads ~15 GB, so it only happens when unloading
+    /// is enabled and this isn't the first generation after a load.
+    fn ensure_lm(&mut self) -> Result<&HeartMuLaLm> {
+        if self.lm.is_none() {
+            let w = LmWeights::load(&self.cfg.lm_dir, &self.dev)?;
+            let lm = HeartMuLaLm::load(&w, &self.dev)?;
+            drop(w); // free the f32 source once the resident model is built
+            self.lm = Some(lm);
+        }
+        Ok(self.lm.as_ref().unwrap())
+    }
+
     /// Generate a song from `lyrics` and style `tags`. Blocking and single-threaded.
-    pub fn generate(&self, lyrics: &str, tags: &str, opts: &GenOptions) -> Result<Audio> {
+    pub fn generate(&mut self, lyrics: &str, tags: &str, opts: &GenOptions) -> Result<Audio> {
         self.generate_with_progress(lyrics, tags, opts, &mut |_| {})
     }
 
@@ -162,7 +188,7 @@ impl Engine {
     /// and the codec decode advance. The callback is purely observational: generation
     /// is bit-identical with or without it (no numerical behaviour changes).
     pub fn generate_with_progress(
-        &self,
+        &mut self,
         lyrics: &str,
         tags: &str,
         opts: &GenOptions,
@@ -180,7 +206,7 @@ impl Engine {
                     total,
                 });
             };
-            self.lm.generate_codes(
+            self.ensure_lm()?.generate_codes(
                 &p.tokens,
                 &p.mask,
                 Some(p.muq_idx),
@@ -199,15 +225,20 @@ impl Engine {
                 "model emitted EOS immediately (no audio)".into(),
             ));
         }
-        // Release the LM's generation residency (per-frame intermediates + dropped KV cache)
-        // before the codec runs. Otherwise the whole song's LM pool stays live on the GPU
-        // through the first segment's decode, and on a memory-tight Metal device the decode's
-        // working set tips it over the budget → OOM. The codec then starts from just the two
-        // resident model weights.
+        // Release the LM's per-frame residency (intermediates + dropped KV cache) before the
+        // codec runs — otherwise the whole song's LM pool stays live on the GPU through the first
+        // segment's decode and, on a memory-tight Metal device, the decode's working set tips it
+        // over the budget → OOM. If `unload_lm` is set, additionally drop the LM weights (~7.5 GB)
+        // themselves: the synchronize() below is what actually returns them to the OS (a bare drop
+        // only re-pools them), so the codec stage runs with that much more headroom; the LM is
+        // reloaded lazily on the next generation.
+        if self.unload_lm {
+            self.lm = None;
+        }
         self.dev.synchronize()?;
-        // Multi-segment overlap-add → full-length songs. The per-channel split + per-stage
-        // synchronize in the decoder keep each segment's GPU residency bounded. `None` ⇒ each
-        // segment draws its flow-matching latent with randn internally.
+        // Multi-segment overlap-add → full-length songs. Each segment's decode flushes after every
+        // upsample stage (`ScalarDecoder::decode_one`) so the ×1920 conv working set stays bounded
+        // regardless of song length. The codec draws each segment's flow-matching latent internally.
         let wav = {
             let mut on_seg = |done: usize, total: usize| {
                 on(GenProgress {
@@ -250,7 +281,7 @@ impl Engine {
     /// whole `Audio`. Returns the total duration in seconds. The audio is identical to
     /// [`generate`] — just delivered in finalised slices as each segment completes.
     pub fn generate_streaming(
-        &self,
+        &mut self,
         lyrics: &str,
         tags: &str,
         opts: &GenOptions,
@@ -266,7 +297,7 @@ impl Engine {
                     total,
                 });
             };
-            self.lm.generate_codes(
+            self.ensure_lm()?.generate_codes(
                 &p.tokens,
                 &p.mask,
                 Some(p.muq_idx),
@@ -283,6 +314,11 @@ impl Engine {
             return Err(EngineError::Config(
                 "model emitted EOS immediately (no audio)".into(),
             ));
+        }
+        // Free the LM's per-frame residency (and, if `unload_lm`, the LM weights themselves)
+        // before the codec stage — see `generate_with_progress` for the why.
+        if self.unload_lm {
+            self.lm = None;
         }
         self.dev.synchronize()?;
         let wav = {

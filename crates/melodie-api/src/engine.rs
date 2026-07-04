@@ -70,7 +70,7 @@ pub fn spawn_worker(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineJob>();
     let (busy_tx, busy_rx) = watch::channel(false);
     std::thread::spawn(move || {
-        let engine = match Engine::load(&cfg) {
+        let mut engine = match Engine::load(&cfg) {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!(error = %e, "engine load failed; local generation disabled");

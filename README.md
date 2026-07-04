@@ -66,6 +66,7 @@ A/B against the defaults or to debug.
 | --------------------- | -------------------------------------------------------------------------- |
 | `MELODIE_NO_Q8=1`     | depth decoder back to dense bf16 instead of Q8_0 (by-ear A/B; ~11% slower) |
 | `MELODIE_CODEC_F32=1` | codec DiT back to f32 (by-ear A/B; same speed, ~1.5 GB more resident)      |
+| `MELODIE_UNLOAD_LM=1` | drop the LM (~7.5 GB) after its frame loop, before the codec — much lower codec-stage peak RAM, but reloads the LM (~15 GB read) each song |
 | `MELODIE_PROFILE=1`   | per-frame LM timing summary on stdout                                      |
 | `MELODIE_MODELS_DIR`  | target dir of `just fetch-models` (default `data/models`)                  |
 

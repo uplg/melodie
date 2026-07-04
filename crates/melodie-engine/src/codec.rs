@@ -404,9 +404,17 @@ impl ScalarDecoder {
         let mut x = conv1d(&x, &self.conv0_w, &self.conv0_b, false, 1, 1)?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
+            // Flush after every ×stride upsample stage. Each stage is a different-size conv
+            // `im2col`, and candle's Metal pool never reuses varying-size buffers — without this
+            // the pool holds the SUM of all stages' activations+im2col (multiple GB) instead of
+            // just the current one. synchronize() drains the GPU and returns the freed buffers to
+            // the OS. This is what keeps the decode's residency bounded regardless of song length.
+            x.device().synchronize()?;
         }
         x = self.post.forward(&x)?;
+        x.device().synchronize()?;
         x = conv1d(&x, &self.conv7_w, &self.conv7_b, true, 1, 1)?;
+        x.device().synchronize()?; // the final ×2 conv's im2col is the widest — flush it too
         // (1, 1, L) → (1, L)
         Ok(x.squeeze(1)?)
     }
