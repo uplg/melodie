@@ -46,7 +46,7 @@ impl Default for GenOptions {
             max_frames: 2250,
             cfg_scale: 1.25,
             topk: 50,
-            temperature: 1.0,
+            temperature: 0.85,
         }
     }
 }
